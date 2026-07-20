@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "prebuild": "node scripts/write-build-meta.js && jest --json --outputFile=public/test-report.json || true",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
