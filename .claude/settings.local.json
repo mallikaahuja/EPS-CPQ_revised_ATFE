@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir=false --import-alias=\"@/*\" --no-git)",
+      "Bash(npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir=false --import-alias=\"@/*\" --no-git --yes)",
+      "Bash(npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir=false --import-alias=\"@/*\" --no-git -e with-tailwindcss)",
+      "Bash(cp C:/Users/malli/Documents/sizing-calculator/ATFE_SPECIFICATION_v2.md /tmp/ATFE_SPECIFICATION_v2.md)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(mkdir -p /tmp/atfe-temp)",
+      "Bash(cp C:/Users/malli/Documents/sizing-calculator/ATFE_SPECIFICATION_v2.md /tmp/atfe-temp/)",
+      "Bash(cp /tmp/atfe-temp/ATFE_SPECIFICATION_v2.md C:/Users/malli/Documents/sizing-calculator/)",
+      "Bash(npx shadcn@latest init --yes)",
+      "Bash(npm install *)",
+      "Bash(npx jest *)"
+    ]
+  }
+}
