@@ -15,7 +15,7 @@ git push -u origin main
 #    Every push to main auto-deploys.
 ```
 
-Local dev: `npm install && npm run dev` · Tests: `npx jest` (47 tests, all must pass)
+Local dev: `npm install && npm run dev` · Tests: `npx jest` (52 tests, all must pass)
 
 ## What's inside
 
