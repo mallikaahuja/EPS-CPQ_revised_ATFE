@@ -35,7 +35,8 @@ import type {
 import { SOLVENT_DB, getPropertyAtTemp, antoineTboil, watsonLatentHeat } from '@/lib/data/solvents';
 import { getSteamProperties } from '@/lib/data/steam';
 import {
-  getURangeForViscosity, getUDefault, SOLVENT_VISCOSITY_PROXY, getPowerPerArea,
+  getURangeForViscosity, getUDefault, U_continuous,
+  SOLVENT_VISCOSITY_CLASS, getURangeForClass, VISCOSITY_CLASS_ORDER, type ViscosityClass,
 } from '@/lib/data/u-ranges';
 import { calculateBPE_NaCl } from '@/lib/data/bpe-correlations';
 import { runSanityChecks } from '@/lib/engines/sanity';
@@ -43,7 +44,7 @@ import {
   bubblePoint, mixtureLatentHeat, mixtureProperty,
   nonIdealityWarnings, boilingRangeSpread,
 } from '@/lib/engines/mixture';
-import { selectBody, type ATFEBody } from '@/lib/data/bodies';
+import { selectBody, BODY_REGISTRY, type ATFEBody } from '@/lib/data/bodies';
 import { MOC_PROPERTIES } from '@/lib/data/materials';
 import {
   ROTOR_REGISTRY, filmCoefficient, checkRotorGates, correctViscosityToGapShear,
@@ -115,6 +116,11 @@ interface UResolutionCtx {
   N_rpm: number;
   bladeCount: number;
   Cp_feed_J: number;
+  // Phase 0.4: set when no measured viscosity exists at all — a solvent
+  // CATEGORY, not a number. Forces the class-bucket lookup below regardless of
+  // `mode`; the class is never converted into a cP value and run through the
+  // Phase 4 film-coefficient correlation (Appendix C trap 5).
+  viscosityClassUsed?: ViscosityClass;
 }
 function resolveU(
   ctx: UResolutionCtx, mode: 'preliminary' | 'detailed', viscosity_cP: number, T_boil_local: number,
@@ -127,15 +133,32 @@ function resolveU(
   if (ctx.inputs.uValueOverride != null && ctx.inputs.uValueOverride > 0) {
     return { U: ctx.inputs.uValueOverride };
   }
+  const h_outer = computeHOuter(ctx.inputs.heatingMedium, ctx.jacketType, ctx.T_medium_local);
+
+  // Phase 0.4: no measured viscosity — use the solvent CATEGORY's U bucket
+  // directly (a discrete lookup, like the preliminary path) regardless of
+  // `mode`. Detailed mode's film-coefficient correlation (Phase 4) genuinely
+  // cannot run without a measured cP value; falling back to a fabricated
+  // numeric proxy just to keep it running is exactly the mistake Phase 0.4
+  // removes. The Phase 3 jacket-medium correction still applies — it depends
+  // only on the jacket, not on viscosity.
+  if (ctx.viscosityClassUsed != null) {
+    const range = getURangeForClass(ctx.viscosityClassUsed);
+    const f_medium = mediumCorrectionFactor(range.default, h_outer);
+    return { U: range.default * f_medium };
+  }
+
   const R_fouling_inner = getFoulingFactor(ctx.inputs.foulingTendency ?? 'low');
   const R_fouling_outer = 0.0001;
   const R_wall = ctx.t_wall_m / ctx.k_wall;
-  const h_outer = computeHOuter(ctx.inputs.heatingMedium, ctx.jacketType, ctx.T_medium_local);
   const h_outer_source: UBreakdown['h_outer_source'] =
     ctx.inputs.heatingMedium === 'steam' ? 'steam_constant' : 'jacket_correlation';
 
   if (mode === 'preliminary') {
-    const U_bucket = getUDefault(viscosity_cP);
+    // Phase 9.2: continuous log-log interpolation on Perry's anchors, not the
+    // step-function bucket default — makes the Phase 0.2 viscosity sensitivity
+    // a real, non-zero number instead of an artefact of bucket boundaries.
+    const U_bucket = U_continuous(viscosity_cP);
     const f_medium = mediumCorrectionFactor(U_bucket, h_outer);
     return { U: U_bucket * f_medium };
   }
@@ -362,20 +385,49 @@ export function calculateATFE(inputs: ATFEInputs, mode: 'preliminary' | 'detaile
     errors.push(`Heating medium temperature (${T_heating.toFixed(1)}°C) exceeds max allowable product temperature (${inputs.maxAllowableProductTemp}°C). Thermal degradation risk.`);
   }
 
-  // --- 10. Feed viscosity (unchanged resolution logic) ---
+  // --- 10. Feed viscosity ---
   let feedViscosity_cP: number;
+  let viscosityClassUsed: ViscosityClass | undefined;
   if (inputs.feedViscosityAtOpTemp != null) {
     feedViscosity_cP = inputs.feedViscosityAtOpTemp;
   } else if (inputs.feedViscosityAt25 != null) {
     feedViscosity_cP = inputs.feedViscosityAt25;
     warnings.push('Using feed viscosity at 25°C as proxy for operating viscosity — may be lower than actual operating viscosity.');
   } else {
-    if (mixComps) {
-      feedViscosity_cP = Math.max(...mixComps.map(c => SOLVENT_VISCOSITY_PROXY[c.solvent] ?? 1.0));
-    } else {
-      feedViscosity_cP = SOLVENT_VISCOSITY_PROXY[inputs.solventType] ?? 1.0;
+    // Phase 0.4: no measured viscosity. The deleted SOLVENT_VISCOSITY_PROXY
+    // listed ethanol/toluene at a fabricated 25 cP (real values 0.56-1.07 cP)
+    // and ran that invented number through getURangeForViscosity() and the
+    // +/-20% sensitivity arithmetic as though it were measured. A category
+    // stands in for a discrete U bucket ONLY — see resolveU() and the
+    // sensitivity block below, neither of which ever converts the category
+    // back into a cP number (Appendix C trap 5).
+    const classes = mixComps
+      ? mixComps.map(c => SOLVENT_VISCOSITY_CLASS[c.solvent] ?? 'polar_heavy')
+      : [SOLVENT_VISCOSITY_CLASS[inputs.solventType] ?? 'polar_heavy'];
+    viscosityClassUsed = classes.reduce<ViscosityClass>(
+      (worst, c) => (VISCOSITY_CLASS_ORDER.indexOf(c) > VISCOSITY_CLASS_ORDER.indexOf(worst) ? c : worst),
+      'water_like',
+    );
+    warnings.push(
+      `No measured viscosity entered — using solvent category "${viscosityClassUsed}" for a preliminary U-bucket lookup only. ` +
+      `This is NOT a substitute for a measured value: it cannot drive the detailed film-coefficient model, the outlet-` +
+      `viscosity march, or the viscosity sensitivity check. Enter feed viscosity for an accurate sizing.`
+    );
+    if (mode === 'detailed') {
+      errors.push(
+        'Detailed mode requires a measured feed viscosity (feedViscosityAtOpTemp or feedViscosityAt25) — a solvent ' +
+        'category alone is not sufficient input for the film-coefficient correlation. Falling back to a preliminary-' +
+        'style category U estimate below; do not quote from it.'
+      );
     }
-    warnings.push('Using pure solvent viscosity as proxy — actual feed viscosity with dissolved solids will be higher. Enter measured viscosity for accurate sizing.');
+    // Internal numeric stand-in ONLY so the rest of the pipeline (rotor gates,
+    // the concentration march) stays numerically defined — never reported as
+    // a measured viscosity. resolveU() ignores this value entirely whenever
+    // viscosityClassUsed is set (it uses the class's U bucket directly), so
+    // this number never reaches the film-coefficient correlation. All three
+    // classes are far below every rotor's viscosity ceiling, so 0 is a safe,
+    // inert placeholder for the rotor gate check too.
+    feedViscosity_cP = 0;
   }
 
   // --- Phase 6.1: concentrate viscosity anchor + mu(x) exponential model ---
@@ -421,7 +473,10 @@ export function calculateATFE(inputs: ATFEInputs, mode: 'preliminary' | 'detaile
   // U, which depends on rotor rpm, which depends on the body's D_rotor) — the
   // same bootstrap-then-refine structure the pre-Phase-1 engine already used
   // (it back-derived D_rotor from an A_est via getUDefault too). ---
-  const A_est_bootstrap = (Q_total_preSuperheat * 1000) / (getUDefault(feedViscosity_cP) * Math.max(deltaT_global_arith, 1));
+  const U_bootstrap = viscosityClassUsed != null
+    ? getURangeForClass(viscosityClassUsed).default
+    : U_continuous(feedViscosity_cP); // Phase 9.2 — continuous, not the old bucket step function
+  const A_est_bootstrap = (Q_total_preSuperheat * 1000) / (U_bootstrap * Math.max(deltaT_global_arith, 1));
   const bodySelection = selectBody(A_est_bootstrap, inputs.bodyOverride);
 
   if (bodySelection.exceeded) {
@@ -444,7 +499,10 @@ export function calculateATFE(inputs: ATFEInputs, mode: 'preliminary' | 'detaile
   // Rotor gates — hard errors, not warnings (Phase 4's "rotor selection is a
   // filter, not just a coefficient"). Gated on the worst-case viscosity the
   // machine will see (discharge, if known) and the hottest temperature the
-  // wiper sees (jacket inlet).
+  // wiper sees (jacket inlet). Phase 0.4: when only a solvent category is
+  // known, feedViscosity_cP is 0 (inert) — every rotor's viscosity ceiling is
+  // far above any of the three categories, so this gate correctly never fires
+  // without needing a fabricated number.
   const worstCaseViscosity_cP = Math.max(feedViscosity_cP, muExponent_k != null ? inputs.concentrateViscosity! : feedViscosity_cP);
   errors.push(...checkRotorGates(rotor, worstCaseViscosity_cP, T_heating, inputs.solidsAbrasive ?? false));
 
@@ -465,7 +523,7 @@ export function calculateATFE(inputs: ATFEInputs, mode: 'preliminary' | 'detaile
   const uCtx: UResolutionCtx = {
     inputs, mixComps, solvent, moc, t_wall_m, k_wall, jacketType,
     T_medium_local: T_heating, // overridden per-zone / per-point below
-    rotor, N_rpm, bladeCount, Cp_feed_J,
+    rotor, N_rpm, bladeCount, Cp_feed_J, viscosityClassUsed,
   };
 
   // --- Phase 5: area calculation — zone march (default) or single-point ---
@@ -584,9 +642,54 @@ export function calculateATFE(inputs: ATFEInputs, mode: 'preliminary' | 'detaile
     A_required = deltaT_eff > 0 && Q_total_preSuperheat > 0
       ? (Q_total_preSuperheat * 1000) / (U_value * deltaT_eff)
       : 0;
+
+    // Residence time — same lumped holdup estimate the march uses (Phase 8.3
+    // needs a number in both sizing paths, not just zone_march).
+    const { rho: rho_mean_sp } = resolveFluidProps(inputs, mixComps, solvent, T_boil_actual);
+    const meanMassFlow_kgs_sp = ((m_feed + m_concentrate) / 2) / 3600;
+    const holdup_kg_sp = rho_mean_sp * (rotor.effectiveFilmThickness_mm.typical / 1000) * body.heatedArea_m2;
+    residenceTime_min = meanMassFlow_kgs_sp > 0 ? (holdup_kg_sp / meanMassFlow_kgs_sp) / 60 : 0;
   }
 
-  const Q_total = Q_total_preSuperheat + Q_superheat;
+  let Q_total = Q_total_preSuperheat + Q_superheat; // Phase 10.1 nets Q_mechanical out of this below
+
+  // --- Phase 10.1: rotor mechanical power — magnitude fix + credit to the
+  // heat balance. The old `rotorPower = A_selected * getPowerPerArea(mu)` was
+  // a flat 5-15 kW/m² bracket independent of machine size or rotor type: at
+  // 15 kW/m² with U~390/deltaT~50 (the sample 10 m² polymer job) the thermal
+  // flux is ~19.7 kW/m², so the old formula claimed mechanical dissipation was
+  // 76% of the heat input — the machine would be a friction heater. Fixed by
+  // (a) using the per-ROTOR powerFactor_kW_m2(viscosity) already in the
+  // registry (Phase 4) but never wired in, evaluated at each zone's LOCAL
+  // viscosity where the march has it, and (b) a size-scaling factor (specific
+  // power falls as the machine gets larger). Whatever the rotor dissipates
+  // ends up as heat in the product, so it is netted OUT of Q_total — the
+  // jacket needs to supply that much less — computed here, before body
+  // selection, so A_required reflects the credit.
+  const SIZE_ANCHOR_AREA_M2 = 10; // matches the Phase 1 body-registry anchor (ATFE-10)
+  function rotorPowerSizeFactor(area_m2: number): number {
+    // ⚠ PLACEHOLDER — falling specific power with size, normalized to 1.0 at
+    // the 10 m² anchor. Not fitted to any data; Appendix A7 (drive ratings vs.
+    // area from past EcoProcess supplies) should replace this exponent.
+    return Math.pow(SIZE_ANCHOR_AREA_M2 / Math.max(area_m2, 0.1), 0.15);
+  }
+  const rotorSizeFactor = rotorPowerSizeFactor(A_required);
+  let Q_mechanical = profile && profile.length > 0
+    ? profile.reduce((s, z) => s + rotor.powerFactor_kW_m2(z.mu_local_cP) * rotorSizeFactor * z.dA_m2, 0)
+    : rotor.powerFactor_kW_m2(feedViscosity_cP) * rotorSizeFactor * A_required;
+  if (Q_mechanical > 0.2 * Q_total) {
+    warnings.push(`Estimated rotor mechanical dissipation (${Q_mechanical.toFixed(1)} kW) is more than 20% of the thermal duty (${Q_total.toFixed(1)} kW) — this is unusually high for this correlation; verify against an actual drive rating (Appendix A7) before quoting.`);
+  }
+  if (Q_mechanical > 0 && Q_mechanical < Q_total) {
+    const creditFactor = (Q_total - Q_mechanical) / Q_total;
+    A_required *= creditFactor;
+    if (profile) for (const z of profile) z.dA_m2 *= creditFactor;
+    Q_total -= Q_mechanical;
+  } else if (Q_mechanical >= Q_total) {
+    // Sanity floor — a size-factor/registry combination that claims the rotor
+    // alone supplies the whole duty is not physical; do not zero out A_required.
+    Q_mechanical = 0;
+  }
 
   // --- Phase 7: pilot calibration outranks lookup/correlation, not override ---
   let pilotRunIdUsed: string | undefined;
@@ -634,24 +737,42 @@ export function calculateATFE(inputs: ATFEInputs, mode: 'preliminary' | 'detaile
     U_source = 'override';
   }
 
-  const U_range = getURangeForViscosity(feedViscosity_cP);
+  const U_range = viscosityClassUsed != null ? getURangeForClass(viscosityClassUsed) : getURangeForViscosity(feedViscosity_cP);
   if (mode === 'detailed' && sizingMethod === 'single_point') {
     if (U_value < U_range.min * 0.7 || U_value > U_range.max * 1.3) {
       warnings.push(`Calculated U-value (${U_value.toFixed(0)} W/m²·K) outside expected range [${U_range.min}–${U_range.max}]. Review input properties.`);
     }
   }
 
-  // Coulson & Richardson Vol.6 analogue — steam-heated non-agitated
-  // vaporisers, for context only (Phase 0.3 would extend this beyond steam).
-  let crAnalogue: { label: string; min: number; max: number } | undefined;
+  // Coulson & Richardson Vol.6 analogue — steam-heated non-agitated vaporisers
+  // as the base case. Phase 0.3: previously this cross-check existed ONLY for
+  // steam, so a hot-oil quote (the case most likely to be badly wrong) got no
+  // cross-check at all. Extended to every medium by re-bundling the SAME
+  // steam-basis C&R anchor at the job's actual h_outer, via the identical
+  // resistance-series correction Phase 3 already uses for the preliminary U
+  // bucket (mediumCorrectionFactor) — the C&R anchor is itself built on a
+  // condensing-steam jacket (Phase 9.3), so this is re-bundling known physics,
+  // not a new assumption.
+  const aqueous = mixComps ? mixComps.some(c => c.solvent === 'Water') : inputs.solventType === 'Water';
+  const crBaseLabel = aqueous
+    ? 'Steam / aqueous solutions (C&R Vol.6 vaporiser, non-agitated)'
+    : 'Steam / light organics (C&R Vol.6 vaporiser, non-agitated)';
+  const crBaseMin = aqueous ? 1000 : 900;
+  const crBaseMax = aqueous ? 1500 : 1200;
+  let crAnalogue: { label: string; min: number; max: number };
   if (inputs.heatingMedium === 'steam') {
-    const aqueous = mixComps ? mixComps.some(c => c.solvent === 'Water') : inputs.solventType === 'Water';
-    crAnalogue = aqueous
-      ? { label: 'Steam / aqueous solutions (C&R Vol.6 vaporiser, non-agitated)', min: 1000, max: 1500 }
-      : { label: 'Steam / light organics (C&R Vol.6 vaporiser, non-agitated)', min: 900, max: 1200 };
-    if (U_value > crAnalogue.max * 2) {
-      warnings.push(`Selected U (${U_value.toFixed(0)} W/m²·K) is more than 2× the C&R Vol.6 non-agitated analogue (${crAnalogue.min}–${crAnalogue.max}). The agitated-film premium justifies higher U, but this magnitude should be confirmed against pilot/plant data before quoting.`);
-    }
+    crAnalogue = { label: crBaseLabel, min: crBaseMin, max: crBaseMax };
+  } else {
+    const h_outer_actual = computeHOuter(inputs.heatingMedium, jacketType, T_heating);
+    const mediumLabel = inputs.heatingMedium === 'hot_oil' ? 'Hot oil' : 'Hot water';
+    crAnalogue = {
+      label: `${mediumLabel} / ${aqueous ? 'aqueous solutions' : 'light organics'} (C&R Vol.6 vaporiser basis, jacket-corrected from steam)`,
+      min: crBaseMin * mediumCorrectionFactor(crBaseMin, h_outer_actual),
+      max: crBaseMax * mediumCorrectionFactor(crBaseMax, h_outer_actual),
+    };
+  }
+  if (U_value > crAnalogue.max * 2) {
+    warnings.push(`Selected U (${U_value.toFixed(0)} W/m²·K) is more than 2× the C&R Vol.6 non-agitated analogue (${crAnalogue.min.toFixed(0)}–${crAnalogue.max.toFixed(0)}, jacket-corrected). The agitated-film premium justifies higher U, but this magnitude should be confirmed against pilot/plant data before quoting.`);
   }
 
   // --- Area selection: re-select the body at the MARCHED/refined A_required
@@ -676,18 +797,168 @@ export function calculateATFE(inputs: ATFEInputs, mode: 'preliminary' | 'detaile
     A_selected = finalSelection.body.heatedArea_m2;
     overdesign_pct = A_required > 0 ? ((A_selected - A_required) / A_required) * 100 : 0;
     finalBody = finalSelection.body;
+    // Phase 0.1: selectBody() forces the OVERRIDE body regardless of whether
+    // it actually covers A_required (an engineer can name a specific machine
+    // to rate). If that forced body is smaller than the duty needs, this is
+    // the same "silent truncation" failure mode as the ladder-exceeded case
+    // above — a negative overdesign_pct must be a hard error, never a warning
+    // buried in the sanity checks (see sanity.ts's overdesign check).
+    if (inputs.bodyOverride && overdesign_pct < 0) {
+      errors.push(
+        `Forced body override "${inputs.bodyOverride}" (${finalBody.heatedArea_m2} m²) is smaller than the ` +
+        `required area (${A_required.toFixed(1)} m²) — this body cannot meet the duty. Remove the override or ` +
+        `select a larger body.`
+      );
+    }
   }
 
-  // --- 12. Utilities (unchanged — Phase 10 rotor-power/condenser fixes are out of scope for this pass) ---
+  // --- 12. Utilities ---
   let steamConsumption: number | undefined;
   if (inputs.heatingMedium === 'steam' && lambda_steam) {
     steamConsumption = (Q_total * 3600) / lambda_steam;
   }
-  const Q_condenser = Q_latent;
-  const CW_Cp = 4.18;
-  const CW_rise = 10;
+
+  // Phase 10.2a — vapour superheat. The vapour evolves off a liquid surface
+  // that sits BPE degrees ABOVE the vapour's own dew point (T_boil_pure) at
+  // the system pressure — that is the definition of BPE. The vapour leaves
+  // carrying roughly that much sensible superheat and must be de-superheated
+  // to T_boil_pure before it can condense. The old engine's
+  // `Q_condenser = Q_latent` silently assumed BPE = 0 for the vapour stream
+  // even on jobs where BPE (and hence this term) is large.
+  const BPE_for_condenser = profile && profile.length > 0
+    ? profile.reduce((s, z) => s + z.BPE_local_C, 0) / profile.length
+    : BPE;
+  const Cp_vapor_kJ_kgK = 0.5 * Cp_solvent; // ⚠ PLACEHOLDER — vapour-phase Cp approximated as ~0.5x liquid Cp (no vapour Cp data in lib/data/solvents.ts); replace with real vapour Cp per solvent if available.
+  const Q_vapor_superheat = (m_evap * Cp_vapor_kJ_kgK * BPE_for_condenser) / 3600; // kW
+  const Q_condenser = Q_latent + Q_vapor_superheat;
+
+  // Phase 10.2b — coolant medium. Previously coolingWaterTemp, chilledWaterTemp,
+  // and brineTemp were all collected in Section 5 and NONE were read — the
+  // flow calc used a hardcoded 10°C rise with no medium-specific basis at all,
+  // which is simply wrong for a chilled or brine duty (different Cp, and a
+  // much smaller allowable rise to protect the cold-side approach).
+  let condenserMedium: string;
+  let condenserMediumInletTemp_C: number;
+  let CW_Cp: number;
+  let CW_rise: number;
+  if (inputs.brineTemp != null) {
+    condenserMedium = 'brine'; condenserMediumInletTemp_C = inputs.brineTemp;
+    CW_Cp = 3.5; CW_rise = 5; // ⚠ PLACEHOLDER — typical CaCl2/glycol brine; confirm actual brine spec
+  } else if (inputs.chilledWaterTemp != null) {
+    condenserMedium = 'chilled water'; condenserMediumInletTemp_C = inputs.chilledWaterTemp;
+    CW_Cp = 4.18; CW_rise = 5; // ⚠ PLACEHOLDER — chilled water duties typically run a smaller rise than plain cooling water
+  } else {
+    condenserMedium = 'cooling water'; condenserMediumInletTemp_C = inputs.coolingWaterTemp ?? 30;
+    CW_Cp = 4.18; CW_rise = 10; // unchanged from the pre-Phase-10 constant
+  }
   const coolingWaterFlow = (Q_condenser * 3600) / (CW_Cp * CW_rise);
-  const rotorPower = A_selected * getPowerPerArea(feedViscosity_cP);
+
+  const T_CONDENSE_MIN_APPROACH_C = 5; // ⚠ PLACEHOLDER minimum approach
+  if (condenserMediumInletTemp_C + T_CONDENSE_MIN_APPROACH_C >= T_boil_pure) {
+    errors.push(`${condenserMedium} at ${condenserMediumInletTemp_C}°C leaves less than the assumed ${T_CONDENSE_MIN_APPROACH_C}°C approach to the vapour dew point (${T_boil_pure.toFixed(1)}°C) — this duty cannot condense against the available utility. Use a colder medium (chilled water/brine) or check the vacuum level.`);
+  }
+  if (P_mbar < 100 && Q_condenser > Q_total * 0.6) {
+    warnings.push(`Deep vacuum duty (${P_mbar.toFixed(0)} mbar(a)) with condenser duty (${Q_condenser.toFixed(1)} kW) a large fraction of the total evaporator duty (${Q_total.toFixed(1)} kW) — the condenser, not the evaporator, is often the limiting/most expensive item at this vacuum level. Size and cost the condenser separately; this tool only sizes the evaporator body.`);
+  }
+
+  const rotorPower = Q_mechanical; // Phase 10.1 — same quantity, kept under its original field name
+
+  // --- Phase 8: envelope checks. All limits below come from the engineering
+  // team's supplied limits table — Appendix A5: confirm whether that table
+  // describes EcoProcess's own machines or a third-party vendor's before
+  // treating these as a specification rather than a starting point. Cheap and
+  // independent of everything above; the app previously had none of them and
+  // would quote a 10 m² body for a 200 kg/h feed without complaint. ---
+
+  // 8.1 — Loading rate (minimum wetting / flooding). Below the minimum the
+  // film breaks and product bakes onto the wall; above the maximum, flooding.
+  const loading_kgh_m2 = m_feed / finalBody.heatedArea_m2;
+  if (loading_kgh_m2 < 50) {
+    errors.push(`Loading (${loading_kgh_m2.toFixed(0)} kg/h·m²) is below the 50 kg/h·m² minimum wetting rate for the selected ${finalBody.id} — the film will break and product will bake onto the wall. Select a smaller body or increase feed rate.`);
+  } else if (loading_kgh_m2 > 1000) {
+    errors.push(`Loading (${loading_kgh_m2.toFixed(0)} kg/h·m²) exceeds the 1000 kg/h·m² flooding limit for the selected ${finalBody.id}. Select a larger body or reduce feed rate.`);
+  }
+
+  // 8.2 — Turndown (20-100% of design loading), plus the rotor's own
+  // deployment floor for hinged blades (they need centrifugal force to
+  // deploy and simply stop working below rotor.minTurndownFraction).
+  const turndownFeed_kgh = inputs.minimumTurndownFeed_kgh ?? m_feed * 0.2;
+  const turndownLoading_kgh_m2 = turndownFeed_kgh / finalBody.heatedArea_m2;
+  const rotorTurndownFloor_kgh = m_feed * rotor.minTurndownFraction;
+  if (turndownLoading_kgh_m2 < 50) {
+    errors.push(`At the minimum turndown feed rate (${turndownFeed_kgh.toFixed(0)} kg/h), loading falls to ${turndownLoading_kgh_m2.toFixed(0)} kg/h·m² — below the 50 kg/h·m² minimum wetting rate. Narrow the turndown range or add a smaller trim unit.`);
+  }
+  if (turndownFeed_kgh < rotorTurndownFloor_kgh) {
+    errors.push(`At the minimum turndown feed rate (${turndownFeed_kgh.toFixed(0)} kg/h), flow is below the ${rotor.label} rotor's minimum turndown fraction (${(rotor.minTurndownFraction * 100).toFixed(0)}% of design flow, ${rotorTurndownFloor_kgh.toFixed(0)} kg/h) — hinged/pivoted blades stop deploying properly below this point. Narrow the turndown range or select a fixed rigid rotor.`);
+  }
+
+  // 8.3 — Residence time (< 1 min generic envelope; tighter product-specific
+  // limit for heat-sensitive material if supplied).
+  if (residenceTime_min != null) {
+    if (residenceTime_min > 1) {
+      errors.push(`Estimated residence time (${residenceTime_min.toFixed(2)} min) exceeds the 1 min envelope limit — product will over-cook/degrade in the film. Reduce feed rate, increase machine size, or select a rotor with a thinner effective film.`);
+    }
+    if (inputs.heatSensitivity === 'highly_sensitive' && inputs.maxResidenceTime_min != null && residenceTime_min > inputs.maxResidenceTime_min) {
+      errors.push(`Estimated residence time (${residenceTime_min.toFixed(2)} min) exceeds the product-specific degradation limit (${inputs.maxResidenceTime_min} min) for this heat-sensitive material.`);
+    }
+  }
+
+  // 8.4 — Viscosity ceiling: enforced as a hard gate in checkRotorGates() above
+  // (Phase 4), including the flagged 70,000 cP vs 400,000 cP contradiction
+  // between the general limits table and the sample configuration (Appendix A4).
+
+  // 8.5 — Vapour velocity (previously absent entirely: `grep -rn
+  // "vapor.*velocit|vaporRate|annul|entrain" lib/` returned nothing). At deep
+  // vacuum the vapour volumetric flow is enormous and this is frequently the
+  // limiting constraint — a model that only sizes on heat transfer will
+  // silently under-diameter these jobs.
+  function resolveVaporMolarMass_g_mol(): number {
+    if (mixComps && mixtureInfo?.vaporMassFractions) {
+      let invM = 0;
+      for (const [name, yMass] of Object.entries(mixtureInfo.vaporMassFractions)) {
+        const Mi = SOLVENT_DB[name]?.M ?? inputs.customSolventProps?.M ?? 60;
+        invM += yMass / Mi;
+      }
+      return invM > 0 ? 1 / invM : 60;
+    }
+    if (solvent) return solvent.M;
+    return inputs.customSolventProps?.M ?? 60; // ⚠ fallback if custom solvent M missing
+  }
+  const M_vapor_kg_kmol = resolveVaporMolarMass_g_mol();
+  const T_vapor_K = T_boil_actual + 273.15;
+  const P_vapor_Pa = P_mbar * 100;
+  const R_UNIVERSAL = 8314; // J/(kmol·K)
+  const rho_vapour_kg_m3 = (P_vapor_Pa * M_vapor_kg_kmol) / (R_UNIVERSAL * T_vapor_K); // ideal gas — adequate here
+  const Q_vapour_m3s = (m_evap / 3600) / Math.max(rho_vapour_kg_m3, 1e-6);
+  const A_free_m2 = (Math.PI / 4) * finalBody.shellID_m ** 2 * finalBody.freeVapourAreaFraction;
+  const vapourVelocity_m_s = A_free_m2 > 0 ? Q_vapour_m3s / A_free_m2 : 0;
+  // ⚠ Velocity limits are PLACEHOLDERS (Appendix A10) — the real limit depends
+  // on entrainment and allowable pressure drop, and at deep vacuum the pressure
+  // drop check matters more than velocity itself (a few mbar of ΔP through the
+  // rotor annulus can be a large fraction of the operating pressure and raise
+  // the effective boiling temperature above what the design assumes).
+  if (vapourVelocity_m_s > 50) {
+    errors.push(`Vapour velocity in the shell annulus (${vapourVelocity_m_s.toFixed(1)} m/s) exceeds the ⚠ placeholder 50 m/s hard limit — entrainment/pressure-drop risk. Increase body size or reduce evaporation rate. (Limit is a placeholder pending Appendix A10 data.)`);
+  } else if (vapourVelocity_m_s > 20) {
+    warnings.push(`Vapour velocity in the shell annulus (${vapourVelocity_m_s.toFixed(1)} m/s) exceeds the ⚠ placeholder 20 m/s caution threshold — entrainment and pressure drop become significant, especially at deep vacuum where a few mbar of ΔP can materially raise the effective boiling temperature. Confirm against Appendix A10 data before quoting a deep-vacuum job at this rate.`);
+  }
+
+  // 8.6 — Machine/utility capacity limits (feed rate, evaporation rate,
+  // heating temperature, process pressure) from the same supplied limits table.
+  if (inputs.feedRate < 20 || inputs.feedRate > 100000) {
+    errors.push(`Feed rate ${inputs.feedRate.toFixed(0)} kg/h is outside the supported envelope (20-100,000 kg/h per the supplied limits table — confirm whether this is EcoProcess's own spec or a third-party vendor's, Appendix A5).`);
+  }
+  if (m_evap > 40000) {
+    const largestArea = BODY_REGISTRY[BODY_REGISTRY.length - 1].heatedArea_m2;
+    errors.push(`Evaporation duty ${m_evap.toFixed(0)} kg/h exceeds the supported envelope (up to 40,000 kg/h). This implies areas far beyond the current ${largestArea} m² ladder — confirm with engineering what EcoProcess actually builds and whether a multi-unit parallel configuration (Phase 0.1) applies.`);
+  }
+  if (T_heating > 380) {
+    errors.push(`Heating medium temperature ${T_heating.toFixed(1)}°C exceeds the supported envelope (up to 380°C).`);
+  }
+  const P_barg = (P_mbar - 1013.25) / 1000;
+  if (P_barg < -1 || P_barg > 30) {
+    errors.push(`Operating pressure ${P_barg.toFixed(2)} bar(g) is outside the supported envelope (-1 to 30 bar(g)).`);
+  }
 
   // --- 13. Sensitivity analysis ---
   const sensitivity: SensitivityResult[] = [];
@@ -696,28 +967,38 @@ export function calculateATFE(inputs: ATFEInputs, mode: 'preliminary' | 'detaile
     return (Q * 1000) / (U * dT);
   }
 
-  // Viscosity ±20% — now recomputes U through the SAME resolution path in both
-  // modes (the pre-Phase-4 engine reused U_value unchanged in detailed mode,
-  // making this sensitivity a 0.0% no-op by construction whenever the film
-  // model has real viscosity dependence, which it now always does).
-  const visc_high = feedViscosity_cP * 1.2;
-  const visc_low  = feedViscosity_cP * 0.8;
-  const U_high = mode === 'preliminary'
-    ? getUDefault(visc_high) * mediumCorrectionFactor(getUDefault(visc_high), computeHOuter(inputs.heatingMedium, jacketType, T_heating))
-    : resolveU({ ...uCtx, T_medium_local: T_heating }, mode, visc_high, T_boil_actual).U;
-  const U_low = mode === 'preliminary'
-    ? getUDefault(visc_low) * mediumCorrectionFactor(getUDefault(visc_low), computeHOuter(inputs.heatingMedium, jacketType, T_heating))
-    : resolveU({ ...uCtx, T_medium_local: T_heating }, mode, visc_low, T_boil_actual).U;
-  const A_visc_high = calcA(Q_total, U_high, deltaT_eff);
-  const A_visc_low  = calcA(Q_total, U_low,  deltaT_eff);
-  sensitivity.push({
-    parameter: 'Feed viscosity', change: '+20%', A_new: A_visc_high,
-    A_change_pct: A_required > 0 ? ((A_visc_high - A_required) / A_required) * 100 : 0,
-  });
-  sensitivity.push({
-    parameter: 'Feed viscosity', change: '-20%', A_new: A_visc_low,
-    A_change_pct: A_required > 0 ? ((A_visc_low - A_required) / A_required) * 100 : 0,
-  });
+  // Viscosity ±20% (Phase 0.2/9.2) — recomputes U through the SAME resolution
+  // path in both modes, using U_continuous (not the old bucket step function)
+  // in preliminary mode so a +/-20% perturbation always shows a real,
+  // non-zero area change instead of an artefact of bucket boundaries.
+  // Phase 0.4: when no measured viscosity exists (a solvent CATEGORY only),
+  // perturbing it by a percentage would be arithmetic on something that was
+  // never a number — report "not computable" instead of a fabricated 0.0%.
+  if (viscosityClassUsed != null) {
+    sensitivity.push({
+      parameter: 'Feed viscosity', change: '±20%', A_new: NaN, A_change_pct: NaN,
+      note: 'not computable — no measured viscosity (solvent category only)',
+    });
+  } else {
+    const visc_high = feedViscosity_cP * 1.2;
+    const visc_low  = feedViscosity_cP * 0.8;
+    const U_high = mode === 'preliminary'
+      ? U_continuous(visc_high) * mediumCorrectionFactor(U_continuous(visc_high), computeHOuter(inputs.heatingMedium, jacketType, T_heating))
+      : resolveU({ ...uCtx, T_medium_local: T_heating }, mode, visc_high, T_boil_actual).U;
+    const U_low = mode === 'preliminary'
+      ? U_continuous(visc_low) * mediumCorrectionFactor(U_continuous(visc_low), computeHOuter(inputs.heatingMedium, jacketType, T_heating))
+      : resolveU({ ...uCtx, T_medium_local: T_heating }, mode, visc_low, T_boil_actual).U;
+    const A_visc_high = calcA(Q_total, U_high, deltaT_eff);
+    const A_visc_low  = calcA(Q_total, U_low,  deltaT_eff);
+    sensitivity.push({
+      parameter: 'Feed viscosity', change: '+20%', A_new: A_visc_high,
+      A_change_pct: A_required > 0 ? ((A_visc_high - A_required) / A_required) * 100 : 0,
+    });
+    sensitivity.push({
+      parameter: 'Feed viscosity', change: '-20%', A_new: A_visc_low,
+      A_change_pct: A_required > 0 ? ((A_visc_low - A_required) / A_required) * 100 : 0,
+    });
+  }
 
   const A_dT_plus  = calcA(Q_total, U_value, deltaT_eff + 10);
   const A_dT_minus = calcA(Q_total, U_value, Math.max(deltaT_eff - 10, 1));
@@ -770,7 +1051,8 @@ export function calculateATFE(inputs: ATFEInputs, mode: 'preliminary' | 'detaile
     },
     rotor: { id: rotor.id, label: rotor.label, bladeCount },
     sizingMethod, profile, residenceTime_min,
-    steamConsumption, Q_condenser, coolingWaterFlow, rotorPower,
+    steamConsumption, Q_condenser, coolingWaterFlow, condenserMedium, rotorPower, Q_mechanical,
+    vapourVelocity_m_s, viscosityClassUsed,
     sensitivity,
     sanityChecks: checks, pilotTriggers,
     warnings, errors,

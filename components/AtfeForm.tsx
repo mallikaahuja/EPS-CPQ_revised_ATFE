@@ -380,6 +380,18 @@ export default function AtfeForm({ onCalculate, mode }: Props) {
           </Field>
         </FieldRow>
 
+        {/* Phase 8 envelope checks — previously unmodeled (8.2 turndown, 8.3
+            residence time degradation limit). Both optional: 8.2 defaults to
+            20% of feed rate, 8.3 defaults to the generic 1 min envelope only. */}
+        <FieldRow>
+          <Field label="Minimum Turndown Feed Rate" hint="kg/hr — leave blank to check the generic 20% turndown point">
+            {inp('minimumTurndownFeed_kgh', 'auto')}
+          </Field>
+          <Field label="Max Residence Time" hint="min — product-specific degradation limit, in addition to the generic 1 min envelope">
+            {inp('maxResidenceTime_min', 'auto')}
+          </Field>
+        </FieldRow>
+
         <Field label="Corrosive Nature">
           {sel('corrosiveNature', [
             { value: 'non_corrosive', label: 'Non-Corrosive' },

@@ -75,13 +75,24 @@ export function runSanityChecks(ctx: SanityInput): { checks: SanityCheck[]; pilo
         : 'BPE = 0 (dilute/pure feed)',
   });
 
-  // 6. Overdesign
+  // 6. Overdesign — Phase 0.1: a NEGATIVE overdesign_pct means the selected
+  // body is smaller than the duty requires. The old status expression graded
+  // this identically to "9% overdesign, consider next size up" — advice that
+  // is impossible to follow for a body that cannot physically do the job. A
+  // negative value must always be 'fail', never 'warning'.
+  const overdesignStatus: SanityCheck['status'] =
+    ctx.overdesign_pct < 0 ? 'fail'
+    : ctx.overdesign_pct >= 10 && ctx.overdesign_pct <= 50 ? 'pass'
+    : 'warning';
   checks.push({
     id: 'overdesign',
     label: 'Overdesign margin',
-    status: ctx.overdesign_pct >= 10 && ctx.overdesign_pct <= 50 ? 'pass'
-           : ctx.overdesign_pct < 10 ? 'warning' : 'warning',
-    message: `Overdesign = ${ctx.overdesign_pct.toFixed(1)}%${ctx.overdesign_pct < 10 ? ' — below 10% minimum, consider next size up' : ctx.overdesign_pct > 50 ? ' — consider if exact-size is justified' : ''}`,
+    status: overdesignStatus,
+    message: `Overdesign = ${ctx.overdesign_pct.toFixed(1)}%${
+      ctx.overdesign_pct < 0 ? ' — SELECTED BODY IS UNDERSIZED for this duty; do not quote without resolving'
+      : ctx.overdesign_pct < 10 ? ' — below 10% minimum, consider next size up'
+      : ctx.overdesign_pct > 50 ? ' — consider if exact-size is justified' : ''
+    }`,
   });
 
   // 7. Pilot triggers

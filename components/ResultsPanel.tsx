@@ -161,8 +161,11 @@ export default function ResultsPanel({ results, mode, onModeChange, inputs, onGe
               <Row label="Steam Consumption" value={r.steamConsumption.toFixed(0)} unit="kg/hr" />
             )}
             <Row label="Condenser Duty" value={r.Q_condenser.toFixed(1)} unit="kW" />
-            <Row label="Cooling Water Flow (ΔT=10°C)" value={r.coolingWaterFlow.toFixed(0)} unit="kg/hr" />
-            <Row label="Estimated Rotor Power" value={r.rotorPower.toFixed(1)} unit="kW" />
+            <Row label={`Condensing Medium Flow${r.condenserMedium ? ` (${r.condenserMedium})` : ''}`} value={r.coolingWaterFlow.toFixed(0)} unit="kg/hr" />
+            <Row label="Estimated Rotor Power (mechanical dissipation)" value={r.rotorPower.toFixed(1)} unit="kW" />
+            {r.vapourVelocity_m_s != null && (
+              <Row label="Vapour Velocity (shell annulus)" value={r.vapourVelocity_m_s.toFixed(1)} unit="m/s" />
+            )}
           </Card>
 
           {/* Sensitivity */}
@@ -183,10 +186,16 @@ export default function ResultsPanel({ results, mode, onModeChange, inputs, onGe
                       <tr key={i} className="border-b border-gray-100 last:border-0">
                         <td className="py-1 pr-2 text-gray-600">{s.parameter}</td>
                         <td className="py-1 pr-2 font-medium">{s.change}</td>
-                        <td className="py-1 pr-2 text-right">{s.A_new.toFixed(2)}</td>
-                        <td className={`py-1 text-right font-medium ${s.A_change_pct > 0 ? 'text-orange-600' : 'text-green-600'}`}>
-                          {s.A_change_pct > 0 ? '+' : ''}{s.A_change_pct.toFixed(1)}%
-                        </td>
+                        {s.note ? (
+                          <td className="py-1 text-right text-gray-400 italic" colSpan={2}>{s.note}</td>
+                        ) : (
+                          <>
+                            <td className="py-1 pr-2 text-right">{s.A_new.toFixed(2)}</td>
+                            <td className={`py-1 text-right font-medium ${s.A_change_pct > 0 ? 'text-orange-600' : 'text-green-600'}`}>
+                              {s.A_change_pct > 0 ? '+' : ''}{s.A_change_pct.toFixed(1)}%
+                            </td>
+                          </>
+                        )}
                       </tr>
                     ))}
                   </tbody>

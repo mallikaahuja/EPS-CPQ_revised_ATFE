@@ -148,6 +148,10 @@ export interface ATFEInputs {
   // --- Phase 7: pilot calibration ---
   pilotRunId?: string; // id of a stored PilotRun (lib/data/pilot-runs.ts) to calibrate against
   scaleUpFactor_f?: number; // REQUIRED alongside pilotRunId — h_i,plant = f × h_i,pilot; no default, see Appendix A6
+
+  // --- Phase 8: envelope checks ---
+  minimumTurndownFeed_kgh?: number; // 8.2 — lowest feed rate this duty must still run at; defaults to 20% of feedRate if not given
+  maxResidenceTime_min?: number; // 8.3 — product-specific degradation limit, checked in addition to the generic 1 min envelope
 }
 
 export interface CustomSolventProps {
@@ -261,7 +265,21 @@ export interface ATFEResults {
   steamConsumption?: number; // kg/hr
   Q_condenser: number; // kW
   coolingWaterFlow: number; // kg/hr
-  rotorPower: number; // kW
+  // Phase 10.2: which of the three already-collected utility fields
+  // (coolingWaterTemp/chilledWaterTemp/brineTemp) the condenser duty was
+  // actually evaluated against, and whether that medium can condense the
+  // vapor at this vacuum level (see the feasibility check in errors[]).
+  condenserMedium?: string;
+  rotorPower: number; // kW — Phase 10.1: now rotor.powerFactor_kW_m2(mu_local), not a flat bracket
+  Q_mechanical: number; // kW — same quantity as rotorPower, named to match Appendix B ("Q_mechanical appears in the duty"); already netted out of Q_total above
+
+  // Phase 8.5: vapour velocity in the shell annulus (ideal-gas basis)
+  vapourVelocity_m_s?: number;
+
+  // Phase 0.4: set when no measured viscosity was available and a solvent
+  // CATEGORY was used for a preliminary bucket lookup instead — U_source in
+  // that case reflects a category default, not a calculated or measured value.
+  viscosityClassUsed?: 'water_like' | 'light_organic' | 'polar_heavy';
 
   // Sensitivity analysis
   sensitivity: SensitivityResult[];
@@ -309,6 +327,12 @@ export interface SensitivityResult {
   change: string;
   A_new: number;
   A_change_pct: number;
+  // Phase 0.2/0.4: set instead of a numeric A_new/A_change_pct when the
+  // perturbation cannot honestly be computed (e.g. viscosity is a solvent
+  // CATEGORY, not a measured value — perturbing a category by +/-20% would be
+  // arithmetic on something that was never a number). UI must show this
+  // instead of the percentage, not a misleading 0.0%/NaN%.
+  note?: string;
 }
 
 export interface SanityCheck {

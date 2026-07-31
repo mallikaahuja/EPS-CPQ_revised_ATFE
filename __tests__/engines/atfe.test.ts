@@ -147,17 +147,26 @@ describe('ATFE Engine Validation', () => {
       expect(within(r.Q_total, 1104, 5)).toBe(true);
     });
 
-    test('A_required ≈ 4.67 m² (±10%)', () => {
-      expect(within(r.A_required, 4.67, 10)).toBe(true);
+    // Phase 9.2 (ATFE_SPECIFICATION_v2.md): preliminary-mode U now comes from
+    // U_continuous() (log-log interpolation on Perry's anchors) instead of the
+    // old flat bucket default (2500 W/m²·K for anything under 10 cP). At this
+    // case's 1.5 cP, U_continuous already slopes down from the 1 cP anchor
+    // toward the 100 cP anchor (≈2240 vs the old flat 2500) — a deliberate,
+    // real change: the old bucket was a step function that gave the exact
+    // same U to a 1 cP feed and a 9.9 cP feed, which is what made the Phase
+    // 0.2 viscosity sensitivity a no-op in the first place. Recomputed with
+    // the fixed engine: A_required ≈ 5.35 m², A_selected = 6 m², overdesign ≈ 12%.
+    test('A_required ≈ 5.35 m² (±10%)', () => {
+      expect(within(r.A_required, 5.35, 10)).toBe(true);
     });
 
-    test('A_selected = 5.0 m²', () => {
-      expect(r.A_selected).toBe(5.0);
+    test('A_selected = 6.0 m²', () => {
+      expect(r.A_selected).toBe(6.0);
     });
 
-    test('Overdesign ≈ 7% → warning', () => {
+    test('Overdesign ≈ 12% → pass', () => {
       const check = r.sanityChecks.find(c => c.id === 'overdesign');
-      expect(check?.status).toBe('warning');
+      expect(check?.status).toBe('pass');
     });
 
     test('BPE sanity check passes (accounted for)', () => {

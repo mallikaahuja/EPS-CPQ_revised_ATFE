@@ -1,0 +1,60 @@
+{
+  "$schemaNote": "See scripts/compare-sizing.ts header comment for the full field reference. Each entry's `inputs` is merged onto DEFAULT_INPUTS in the script, so you only need to specify fields that differ from the defaults for a given job. sizingMethod on `inputs` is ignored — the script always runs both paths.",
+  "jobs": [
+    {
+      "name": "Dilute aqueous steam concentration (low viscosity — expect small single-point vs. march delta)",
+      "mode": "detailed",
+      "inputs": {
+        "feedMaterialName": "Dilute process water",
+        "feedRate": 2000,
+        "volatilePercent": 90,
+        "nonVolatilePercent": 10,
+        "solventType": "Water",
+        "feedViscosityAtOpTemp": 2,
+        "targetConcentratePurity": 20,
+        "heatingMedium": "steam",
+        "hotMediumTemp": 120,
+        "operatingPressure": 500,
+        "pressureUnit": "mbar_a",
+        "bpeSource": "not_applicable"
+      }
+    },
+    {
+      "name": "NaCl brine concentration, 15 wt% feed (moderate BPE rise along the machine)",
+      "mode": "detailed",
+      "inputs": {
+        "feedMaterialName": "NaCl Brine",
+        "feedRate": 2000,
+        "volatilePercent": 85,
+        "nonVolatilePercent": 15,
+        "solventType": "Water",
+        "feedViscosityAtOpTemp": 1.5,
+        "heatingMedium": "steam",
+        "steamPressure": 5.0,
+        "operatingPressure": 200,
+        "pressureUnit": "mbar_a",
+        "bpeSource": "nacl_auto",
+        "naclConcentration": 15
+      }
+    },
+    {
+      "name": "High-viscosity organic concentration, 20% -> 60% solids (ATFE_SIZING_FIX_SPEC.md Phase 5 worked example — expect the largest delta)",
+      "mode": "detailed",
+      "inputs": {
+        "feedMaterialName": "Viscous organic concentrate",
+        "feedRate": 1000,
+        "volatilePercent": 80,
+        "nonVolatilePercent": 20,
+        "solventType": "Water",
+        "feedViscosityAtOpTemp": 55,
+        "concentrateViscosity": 8835,
+        "targetConcentratePurity": 60,
+        "heatingMedium": "steam",
+        "hotMediumTemp": 150,
+        "operatingPressure": 1013,
+        "pressureUnit": "mbar_a",
+        "bpeSource": "not_applicable"
+      }
+    }
+  ]
+}

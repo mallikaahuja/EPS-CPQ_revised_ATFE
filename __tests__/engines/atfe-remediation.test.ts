@@ -10,6 +10,7 @@ import { BODY_REGISTRY, getBodyById, selectBody } from '../../lib/data/bodies';
 import { ROTOR_REGISTRY, contactTime_s } from '../../lib/data/rotors';
 import { lmtd, computeHOuter } from '../../lib/data/heating-media';
 import { invertPilotToFilmCoeff, scaleUpFilmCoeff, type PilotRun } from '../../lib/data/pilot-runs';
+import { U_continuous } from '../../lib/data/u-ranges';
 
 const base: ATFEInputs = {
   industry: 'Chemical',
@@ -73,8 +74,15 @@ describe('Phase 1 — Body registry (geometry)', () => {
 
 describe('Phase 2 — MOC and wall thickness', () => {
   test('SS316 vs Hastelloy C276 produce different U in detailed mode, and the delta matches Δ(t/k) exactly', () => {
-    const ss = calculateATFE({ ...base, contactParts: 'SS316', sizingMethod: 'single_point' }, 'detailed');
-    const hc = calculateATFE({ ...base, contactParts: 'HastelloyC276', sizingMethod: 'single_point' }, 'detailed');
+    // Phase 0.4: `base` has no measured viscosity, so without an explicit
+    // feedViscosityAtOpTemp this would now resolve through the solvent-CATEGORY
+    // bucket path (resolveU short-circuits on viscosityClassUsed regardless of
+    // MOC), which would make ss.U_value === hc.U_value and defeat the point of
+    // this test. Supply a measured viscosity so it actually exercises the
+    // Phase 4 film-coefficient correlation (where R_wall/MOC matters).
+    const withVisc = { ...base, feedViscosityAtOpTemp: 1.5 };
+    const ss = calculateATFE({ ...withVisc, contactParts: 'SS316', sizingMethod: 'single_point' }, 'detailed');
+    const hc = calculateATFE({ ...withVisc, contactParts: 'HastelloyC276', sizingMethod: 'single_point' }, 'detailed');
     expect(ss.U_value).not.toBeCloseTo(hc.U_value, 0);
 
     const R_wall_ss = ss.U_breakdown!.R_wall;
@@ -238,5 +246,185 @@ describe('Phase 7 — Pilot inversion and scale-up', () => {
   test('engine errors when pilotRunId is given without scaleUpFactor_f (no default is supplied)', () => {
     const r = calculateATFE({ ...base, pilotRunId: 'nonexistent', sizingMethod: 'single_point' }, 'detailed');
     expect(r.errors.some(e => e.includes('scaleUpFactor_f'))).toBe(true);
+  });
+});
+
+describe('Phase 0 — Guard rails', () => {
+  test('0.1: negative overdesign_pct is always "fail", never "warning" — forced undersized body override', () => {
+    const largest = BODY_REGISTRY[BODY_REGISTRY.length - 1];
+    // Force a tiny body via override on a duty that needs far more area than it has.
+    const smallest = BODY_REGISTRY[0];
+    const r = calculateATFE({ ...base, feedViscosityAtOpTemp: 1.5, feedRate: 50000, bodyOverride: smallest.id, sizingMethod: 'single_point' }, 'preliminary');
+    expect(r.overdesign_pct).toBeLessThan(0);
+    const check = r.sanityChecks.find(c => c.id === 'overdesign');
+    expect(check?.status).toBe('fail');
+    expect(r.errors.some(e => e.includes('cannot meet the duty'))).toBe(true);
+    void largest;
+  });
+
+  test('0.1: exceeding the largest body proposes parallel units and selects no single body', () => {
+    const r = calculateATFE({ ...base, feedViscosityAtOpTemp: 1.5, feedRate: 5000000, sizingMethod: 'single_point' }, 'preliminary');
+    expect(r.sizingExceeded).toBeDefined();
+    expect(r.sizingExceeded!.minUnits).toBeGreaterThan(1);
+  });
+
+  test('0.2: viscosity sensitivity is a real, non-zero number for a measured Newtonian feed, in both modes', () => {
+    const prelim = calculateATFE({ ...base, feedViscosityAtOpTemp: 55, sizingMethod: 'single_point' }, 'preliminary');
+    const detailed = calculateATFE({ ...base, feedViscosityAtOpTemp: 55, sizingMethod: 'single_point' }, 'detailed');
+    for (const r of [prelim, detailed]) {
+      const visc = r.sensitivity.filter(s => s.parameter === 'Feed viscosity');
+      expect(visc.length).toBe(2);
+      for (const s of visc) {
+        expect(s.note).toBeUndefined();
+        expect(Math.abs(s.A_change_pct)).toBeGreaterThan(0.01);
+      }
+    }
+  });
+
+  test('0.3: crAnalogue is extended to hot oil, not just steam, and differs from the steam-basis band', () => {
+    const steamRun = calculateATFE({ ...base, feedViscosityAtOpTemp: 55, heatingMedium: 'steam', sizingMethod: 'single_point' }, 'detailed');
+    const oilRun = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 55, heatingMedium: 'hot_oil', hotMediumTemp: 200,
+      jacketType: 'plain', sizingMethod: 'single_point',
+    }, 'detailed');
+    expect(steamRun.crAnalogue).toBeDefined();
+    expect(oilRun.crAnalogue).toBeDefined();
+    expect(oilRun.crAnalogue!.max).toBeLessThan(steamRun.crAnalogue!.max);
+  });
+
+  test('0.4: no measured viscosity uses a solvent CATEGORY bucket, not a fabricated cP proxy, and disables the viscosity sensitivity', () => {
+    const r = calculateATFE({ ...base, solventType: 'Toluene', sizingMethod: 'single_point' }, 'preliminary');
+    expect(r.viscosityClassUsed).toBe('light_organic');
+    expect(r.warnings.some(w => w.includes('solvent category'))).toBe(true);
+    const visc = r.sensitivity.find(s => s.parameter === 'Feed viscosity');
+    expect(visc?.note).toMatch(/not computable/);
+  });
+
+  test('0.4: detailed mode errors (rather than silently computing a precise-looking answer) when only a category is known', () => {
+    const r = calculateATFE({ ...base, solventType: 'Toluene', sizingMethod: 'single_point' }, 'detailed');
+    expect(r.errors.some(e => e.includes('category alone is not sufficient'))).toBe(true);
+  });
+});
+
+describe('Phase 8 — Envelope checks', () => {
+  test('8.1: loading below 50 kg/h·m² errors; above 1000 kg/h·m² errors', () => {
+    const tenM2 = getBodyById('ATFE-10')!;
+    const tooLow = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, feedRate: 20, bodyOverride: tenM2.id, sizingMethod: 'single_point',
+    }, 'preliminary');
+    expect(tooLow.errors.some(e => e.includes('minimum wetting rate'))).toBe(true);
+
+    const tooHigh = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, feedRate: 50000, bodyOverride: tenM2.id, sizingMethod: 'single_point',
+    }, 'preliminary');
+    expect(tooHigh.errors.some(e => e.includes('flooding limit'))).toBe(true);
+  });
+
+  test('8.2: a turndown feed rate below the rotor deployment floor errors', () => {
+    const r = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, feedRate: 3000, rotorType: 'hinged_pivoted',
+      minimumTurndownFeed_kgh: 500, sizingMethod: 'single_point',
+    }, 'preliminary');
+    // hinged_pivoted minTurndownFraction = 0.45 -> floor = 0.45*3000 = 1350 kg/h > 500
+    expect(r.errors.some(e => e.includes('minimum turndown fraction'))).toBe(true);
+  });
+
+  test('8.3: residence time is computed in both sizing methods', () => {
+    const march = calculateATFE({ ...base, feedViscosityAtOpTemp: 1.5, sizingMethod: 'zone_march' }, 'detailed');
+    const single = calculateATFE({ ...base, feedViscosityAtOpTemp: 1.5, sizingMethod: 'single_point' }, 'detailed');
+    expect(march.residenceTime_min).toBeGreaterThan(0);
+    expect(single.residenceTime_min).toBeGreaterThan(0);
+  });
+
+  test('8.5: vapour velocity is computed and a deep-vacuum, high-evaporation case triggers the caution/error threshold', () => {
+    const smallBody = BODY_REGISTRY[0]; // 0.5 m² -> small shellID/free area
+    const r = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, feedRate: 50000, operatingPressure: 20, pressureUnit: 'mbar_a',
+      bodyOverride: smallBody.id, sizingMethod: 'single_point',
+    }, 'preliminary');
+    expect(r.vapourVelocity_m_s).toBeGreaterThan(0);
+    expect(r.warnings.some(w => w.includes('Vapour velocity')) || r.errors.some(e => e.includes('Vapour velocity'))).toBe(true);
+  });
+
+  test('8.6: feed rate, heating temperature, and pressure outside the supported envelope all error', () => {
+    const lowFeed = calculateATFE({ ...base, feedViscosityAtOpTemp: 1.5, feedRate: 5, sizingMethod: 'single_point' }, 'preliminary');
+    expect(lowFeed.errors.some(e => e.includes('Feed rate'))).toBe(true);
+
+    const hotMedium = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, heatingMedium: 'hot_oil', hotMediumTemp: 400, sizingMethod: 'single_point',
+    }, 'preliminary');
+    expect(hotMedium.errors.some(e => e.includes('380°C'))).toBe(true);
+
+    const highPressure = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, operatingPressure: 35, pressureUnit: 'atmospheric', sizingMethod: 'single_point',
+    }, 'preliminary');
+    // atmospheric pressureUnit ignores the numeric value (see toMbarA) — use kg_cm2_g to actually exceed 30 barg
+    const highPressure2 = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, operatingPressure: 35, pressureUnit: 'kg_cm2_g', sizingMethod: 'single_point',
+    }, 'preliminary');
+    expect(highPressure2.errors.some(e => e.includes('bar(g)'))).toBe(true);
+    void highPressure;
+  });
+});
+
+describe('Phase 9 — Continuous U ladder', () => {
+  test('9.1/9.2: U_continuous matches Perry\'s anchors exactly at 1 / 100 / 10^4 / 10^6 cP', () => {
+    expect(U_continuous(1)).toBeCloseTo(2300, 6);
+    expect(U_continuous(100)).toBeCloseTo(1700, 6);
+    expect(U_continuous(10000)).toBeCloseTo(850, 6);
+    expect(U_continuous(1000000)).toBeCloseTo(280, 6);
+  });
+
+  test('9.2: U_continuous is monotonically non-increasing with viscosity and clamps at the ends', () => {
+    expect(U_continuous(0.001)).toBeCloseTo(2300, 6); // clamped below the lowest anchor
+    expect(U_continuous(1e9)).toBeCloseTo(280, 6); // clamped above the highest anchor
+    const samples = [1, 10, 100, 1000, 10000, 100000, 1000000];
+    for (let i = 1; i < samples.length; i++) {
+      expect(U_continuous(samples[i])).toBeLessThanOrEqual(U_continuous(samples[i - 1]));
+    }
+  });
+});
+
+describe('Phase 10 — Rotor power and condenser', () => {
+  test('10.1: Q_mechanical is a small fraction of thermal duty (not the old 76%-of-duty magnitude) and appears in Q_total', () => {
+    const r = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 400000, concentrateViscosity: 400000,
+      rotorType: 'roller_wiper', sizingMethod: 'single_point',
+    }, 'detailed');
+    expect(r.Q_mechanical).toBeGreaterThan(0);
+    expect(r.Q_mechanical).toBeLessThan(0.5 * (r.Q_total + r.Q_mechanical));
+    expect(r.rotorPower).toBeCloseTo(r.Q_mechanical, 6);
+  });
+
+  test('10.2: condenser duty includes a vapour-superheat term that grows with BPE', () => {
+    const noBpe = calculateATFE({ ...base, feedViscosityAtOpTemp: 1.5, bpeSource: 'not_applicable', sizingMethod: 'single_point' }, 'preliminary');
+    const withBpe = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, bpeSource: 'nacl_auto', naclConcentration: 20, sizingMethod: 'single_point',
+    }, 'preliminary');
+    expect(withBpe.Q_condenser).toBeGreaterThan(withBpe.Q_latent);
+    expect(noBpe.Q_condenser).toBeCloseTo(noBpe.Q_latent, 6);
+  });
+
+  test('10.2: condenser medium selection uses brine/chilled water/cooling water fields, previously all collected and ignored', () => {
+    const withBrine = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, brineTemp: -5, chilledWaterTemp: 7, coolingWaterTemp: 30, sizingMethod: 'single_point',
+    }, 'preliminary');
+    expect(withBrine.condenserMedium).toBe('brine');
+
+    const withChilled = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, chilledWaterTemp: 7, coolingWaterTemp: 30, sizingMethod: 'single_point',
+    }, 'preliminary');
+    expect(withChilled.condenserMedium).toBe('chilled water');
+
+    const plain = calculateATFE({ ...base, feedViscosityAtOpTemp: 1.5, coolingWaterTemp: 30, sizingMethod: 'single_point' }, 'preliminary');
+    expect(plain.condenserMedium).toBe('cooling water');
+  });
+
+  test('10.2: a coolant too warm for the vacuum level fails the feasibility check', () => {
+    const r = calculateATFE({
+      ...base, feedViscosityAtOpTemp: 1.5, operatingPressure: 50, pressureUnit: 'mbar_a',
+      coolingWaterTemp: 60, sizingMethod: 'single_point',
+    }, 'preliminary');
+    expect(r.errors.some(e => e.includes('condense against the available utility'))).toBe(true);
   });
 });

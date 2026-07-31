@@ -7,7 +7,8 @@
     "prebuild": "node scripts/write-build-meta.js && jest --json --outputFile=public/test-report.json || true",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "compare-sizing": "tsx scripts/compare-sizing.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",

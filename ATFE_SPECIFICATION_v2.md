@@ -1417,42 +1417,25 @@ nontrivial follow-on activity in its own right and was not built here;
 flagging the gap honestly was judged better than either skipping pilot
 support entirely or quietly shipping a partial integration without saying so.
 
-## What's still open (explicitly out of scope for this pass)
+## What's still open (as of ADDENDUM v3.0 — superseded below by v3.1)
 
-Phases 0, 8, 9, 10, and 11 of the remediation spec are **not implemented**:
+Phases 0, 8, 9, 10, and 11 of the remediation spec were **not implemented** as
+of v3.0. **This is no longer current** — see ADDENDUM v3.1 immediately below,
+which implements Phase 0 (all four items), Phase 8 (all six envelope checks),
+Phase 9.1/9.2 (the rest of Phase 9 is still open), and Phase 10.1/10.2. Phase
+11 (activity-coefficient thermodynamics) remains open; see v3.1's own
+"What's still open" for the current, accurate list.
 
-- **Phase 0** (guard rails): the size-ladder "hard failure" is effectively
-  subsumed by Phase 1's `selectBody` discriminated result, but the
-  ⚠-marked stopgap widening of the sensitivity perturbation, the
-  `SOLVENT_VISCOSITY_PROXY` → `ViscosityClass` enum fix, and extending
-  `crAnalogue` beyond steam are not done.
-- **Phase 8** (envelope checks): loading rate, turndown, residence-time
-  limit enforcement (a number now exists — `residenceTime_min` — but nothing
-  checks it against the <1 min limit), viscosity ceiling is enforced only via
-  the Phase 4 rotor gates (not a standalone check), and vapor velocity is not
-  computed at all.
-- **Phase 9** (U-lookup rebuild): the preliminary bucket table is still a
-  step function (`U_RANGES` in `u-ranges.ts`); `mediumCorrectionFactor` reacts
-  to jacket medium but the bucket boundaries themselves are unchanged, and the
-  top bucket is still flat above 2000 cP (not extended to Perry's anchors at
-  10⁴/10⁵/10⁶ cP).
-- **Phase 10** (rotor power / condenser): `rotorPower` and `Q_condenser` are
-  untouched from v2.2 — mechanical dissipation is still not credited to the
-  heat balance, and condenser sizing still ignores vapor superheat and
-  non-condensables.
-- **Phase 11** (thermodynamics / activity coefficients): mixtures still use
-  ideal Raoult's law plus the hardcoded non-ideal-pair warning list.
+## Test coverage added (v3.0)
 
-## Test coverage added
-
-`__tests__/engines/atfe-remediation.test.ts` (23 tests) exercises the
-specific per-phase deliverables above: the ATFE-10 anchor dimensions, tip
-speed held constant across the size ladder, `selectBody` hard-failure
-signaling, SS316-vs-Hastelloy `Δ(t/k)` exactness, `lmtd()` degeneracy,
-steam-vs-hot-oil medium sensitivity in both calculation modes, `t_contact`
-exactness, viscosity- and rotor-type-dependence of detailed-mode U (both
-previously impossible), rotor viscosity-ceiling gating, zone-march-vs-
-single-point divergence on a concentration duty, zone-count convergence,
+`__tests__/engines/atfe-remediation.test.ts` (23 tests, since extended — see
+v3.1) exercises the specific per-phase deliverables above: the ATFE-10 anchor
+dimensions, tip speed held constant across the size ladder, `selectBody`
+hard-failure signaling, SS316-vs-Hastelloy `Δ(t/k)` exactness, `lmtd()`
+degeneracy, steam-vs-hot-oil medium sensitivity in both calculation modes,
+`t_contact` exactness, viscosity- and rotor-type-dependence of detailed-mode
+U (both previously impossible), rotor viscosity-ceiling gating, zone-march-
+vs-single-point divergence on a concentration duty, zone-count convergence,
 BPE/`Q_superheat` behavior along the march, and pilot inversion round-trip
 plus its physical-impossibility guard. All pre-existing 52 tests pass
 unchanged — none of their asserted values needed to change (the water/
@@ -1461,3 +1444,259 @@ viscosity and BPE profiles, so the zone march reproduces the old single-point
 numbers for them; the divergence Phase 5 is meant to catch only shows up on
 a genuine concentration duty with a supplied concentrate viscosity, which is
 exactly what `atfe-remediation.test.ts` adds a case for).
+
+---
+
+# ADDENDUM v3.1 (2026-07-31) — Sizing Remediation: Phases 0, 8, 9.1/9.2, 10.1/10.2
+
+Continuation of ADDENDUM v3.0 on branch `remediation/phases-1-7`. Implements
+the guard rails (Phase 0) and the independent, high-value items the
+remediation spec explicitly said could be "done any time" (Phase 8, Phase
+9.1/9.2, Phase 10.1/10.2) — see the spec's own "Phase order is a dependency
+chain, not a priority list" note. Phases 9.3-9.4 (beyond the ladder
+extension), 11 (activity-coefficient thermodynamics), and the rest of Phase 9
+remain open — see "What's still open" below.
+
+## Phase 0 — Guard rails (lib/data/u-ranges.ts, lib/engines/atfe.ts, lib/engines/sanity.ts)
+
+**0.1 — Hard failure on size-ladder truncation, and negative overdesign is
+always a fail.** `selectBody()`'s discriminated `{ exceeded: true }` result
+(built in Phase 1) already pushed a hard error for the ladder-exceeded case.
+Two gaps remained and are now closed: (a) `sanity.ts`'s overdesign check
+graded ANY `overdesign_pct < 10` — including negative values — as merely
+`'warning'` with the message "consider next size up," advice that is
+impossible to follow for a body that cannot physically do the job. Negative
+overdesign is now unconditionally `'fail'`. (b) `selectBody()` honors
+`bodyOverride` even when the forced body is smaller than `A_required` (an
+engineer rating a *specific* named machine) — this is the same silent-
+truncation failure mode by a different path, and `calculateATFE` now pushes
+an explicit error when an override produces a negative overdesign_pct.
+
+**0.2 — Viscosity sensitivity is a real number, not a no-op.** Depends on
+9.2 below (done together, as the spec instructs). Preliminary mode now
+recomputes the ±20% perturbation through `U_continuous()` instead of the old
+bucket step function, so a small perturbation always shows some area change.
+Phase 0.4 interacts here: when only a solvent *category* is known (no
+measured viscosity), perturbing it by a percentage would be arithmetic on
+something that was never a number, so the sensitivity row reports
+`note: 'not computable — no measured viscosity'` instead of a fabricated 0.0%
+— `SensitivityResult` gained an optional `note` field for this, and
+`ResultsPanel.tsx`'s sensitivity table renders it instead of the numeric
+columns when present.
+
+**0.3 — `crAnalogue` extended to every heating medium.** Previously computed
+*only* for `heatingMedium === 'steam'` — hot-oil quotes, the case most likely
+to be badly wrong, got no C&R cross-check at all. The steam-basis band is now
+re-bundled at the job's actual `h_outer` using the SAME resistance-series
+correction Phase 3's `mediumCorrectionFactor` already applies to the
+preliminary U bucket (the C&R anchor is itself built on a condensing-steam
+jacket per Phase 9.3's note, so this re-bundles known physics rather than
+introducing a new assumption).
+
+**0.4 — `SOLVENT_VISCOSITY_PROXY` deleted, replaced by a `ViscosityClass`
+enum.** The old table listed ethanol/toluene at a fabricated 25 cP (real
+values 1.07/0.56 cP) and fed that invented number into
+`getURangeForViscosity()` and the sensitivity arithmetic as though it were a
+measurement. `lib/data/u-ranges.ts` now exports `ViscosityClass =
+'water_like' | 'light_organic' | 'polar_heavy'`, `SOLVENT_VISCOSITY_CLASS`
+(same solvent groupings as the deleted table), and `getURangeForClass()` — a
+category maps straight to a discrete U bucket and is **never** converted back
+into a cP number (Appendix C trap 5). When no measured viscosity exists,
+`calculateATFE` sets `viscosityClassUsed` and `resolveU()` short-circuits to
+the class bucket **regardless of `mode`** — detailed mode's Phase 4
+film-coefficient correlation genuinely cannot run without a measured cP
+value, so it pushes an error and falls back to the same category estimate
+rather than inventing a number to keep the correlation running. The internal
+numeric stand-in used only to keep ancillary bookkeeping (rotor gates, the
+concentration march) from crashing is `0` — provably inert, since `resolveU`
+ignores it whenever `viscosityClassUsed` is set and every category is far
+below any rotor's viscosity ceiling.
+
+## Phase 8 — Envelope checks (lib/engines/atfe.ts)
+
+All six checks from the spec, evaluated against the FINAL selected body
+(`finalBody`), not the Phase 1 geometry bootstrap. All limits are quoted from
+the engineering team's supplied limits table — **Appendix A5 is still open:
+confirm whether that table is EcoProcess's own spec or a third-party
+vendor's** before treating any of these as more than a starting point.
+
+- **8.1 Loading rate** — `m_feed / finalBody.heatedArea_m2` outside
+  50-1000 kg/h·m² is a hard error (film breaks below the minimum; floods
+  above the maximum). Previously unchecked entirely — the app would quote a
+  10 m² body for a 200 kg/h feed without complaint.
+- **8.2 Turndown** — checks `minimumTurndownFeed_kgh` (defaults to 20% of
+  feed rate) against BOTH the 50 kg/h·m² loading floor and the selected
+  rotor's `minTurndownFraction` (hinged/pivoted blades stop deploying below a
+  minimum speed — for those rotors the ROTOR sets the floor, not the duty).
+- **8.3 Residence time** — checked against the generic 1 min envelope and,
+  for `heatSensitivity: 'highly_sensitive'`, an optional product-specific
+  `maxResidenceTime_min`. `residenceTime_min` (added under Phase 5) is now
+  also computed for `sizingMethod: 'single_point'`, not just `zone_march`, so
+  this check works in both sizing paths.
+- **8.4 Viscosity ceiling** — already enforced as a hard gate by Phase 4's
+  `checkRotorGates()`, including the flagged 70,000 cP vs. 400,000 cP
+  contradiction between the general limits table and the sample
+  configuration (Appendix A4). No new code needed; noted here for
+  completeness against the spec's checklist.
+- **8.5 Vapour velocity** — previously absent entirely (`grep -rn
+  "vapor.*velocit|vaporRate|annul|entrain" lib/` returned nothing). Computed
+  from an ideal-gas vapour density at the local boiling temperature/pressure,
+  `m_evap`, and the selected body's `shellID_m`/`freeVapourAreaFraction`
+  (both Phase 1 ⚠ placeholders). Molar mass is mass-weighted across a
+  mixture's vapor composition when applicable. ⚠ The 20 m/s
+  caution / 50 m/s hard-limit thresholds are placeholders (Appendix A10) —
+  the real limit depends on entrainment and allowable pressure drop, and at
+  deep vacuum the pressure-drop check matters more than velocity itself.
+- **8.6 Machine/utility capacity limits** — feed rate (20-100,000 kg/h),
+  evaporation rate (≤40,000 kg/h, flagging that this implies areas beyond the
+  current 20 m² ladder), heating medium temperature (≤380°C), and process
+  pressure (−1 to 30 bar(g)) are all range-checked against the same supplied
+  limits table.
+
+## Phase 9.1/9.2 — Continuous U ladder (lib/data/u-ranges.ts)
+
+**9.1** — `U_RANGES` extended with three new buckets anchored at
+10⁴/10⁵/10⁶ cP (log-log interpolated from the Perry's agitated-film anchors
+below, evaluated at each bucket's upper/worse-case edge), replacing the old
+flat `{ maxCp: Infinity, default: 500 }` top bucket that undersized by ~1.8×
+at the polymer-devolatilization end (Perry's U≈280 @ 10⁶ cP vs. the old flat
+500).
+
+**9.2** — `U_continuous(mu_cP)`: log-log interpolation between the anchors
+`[[1, 2300], [100, 1700], [10000, 850], [1000000, 280]]`, clamped flat beyond
+either end. This is now the ACTUAL U used for preliminary-mode calculation
+(`resolveU`'s preliminary branch, the geometry bootstrap, and the ±20%
+sensitivity) — `U_RANGES`/`getURangeForViscosity` remain as the discrete
+"expected band" shown for context (the `u_range` sanity check, and the
+`U_range` field), per the spec's own framing: "a lookup table is the right
+call for preliminary quoting... the problem is not lookup-versus-calculation,
+it's that the current table is indexed on one variable" — this doesn't
+replace the lookup, it makes the point estimate inside it continuous.
+
+**9.3** (unchanged from v3.0/v2.2) — the repo's own C&R Vol.6 cross-check
+(`crAnalogue`) is retained as a sanity bound, not used as a source of U; see
+the comment in `atfe.ts` and Phase 0.3 above.
+
+**Not done: the rest of Phase 9** — `U_prelim = U_base × f_medium × f_wall`
+as a fully decomposed multi-variable lookup (the spec's stated end state)
+is NOT built; `f_medium` (via `mediumCorrectionFactor`) is wired in, but
+there is no `f_wall(MOC, thickness)` term for preliminary mode — the wall/MOC
+correction only actually varies U in detailed mode via the real resistance
+series. Preliminary mode still varies with viscosity and jacket medium only.
+
+## Phase 10.1/10.2 — Rotor power and condenser (lib/engines/atfe.ts)
+
+**10.1 — Rotor power magnitude, and dissipation credited to the duty.** The
+old `rotorPower = A_selected * getPowerPerArea(feedViscosity_cP)` was a flat
+5-15 kW/m² bracket independent of machine size or rotor type — for the
+sample 10 m² polymer job (U≈390, ΔT≈50) this implied mechanical dissipation
+was 76% of the thermal duty, which would make the machine a friction heater.
+Fixed by wiring in the per-ROTOR `powerFactor_kW_m2(viscosity)` already in
+the Phase 4 registry (present since Phase 4 but never used), evaluated at
+each zone's LOCAL viscosity via the already-computed `profile`, times a ⚠
+PLACEHOLDER size-scaling factor (`(10 / A_required)^0.15`, normalized to 1.0
+at the Phase 1 anchor — not fitted to any data; Appendix A7 drive-rating data
+should replace this). `getPowerPerArea()` is deleted (dead code — nothing
+else used it). Whatever the rotor dissipates ends up as heat in the product,
+so `Q_mechanical` is netted OUT of `Q_total` before body selection
+(`A_required *= (Q_total - Q_mechanical) / Q_total`) — a one-shot linear
+correction rather than a full re-march, since U and ΔT per zone don't change,
+only the net thermal duty does. A warning fires if `Q_mechanical` exceeds
+20% of the thermal duty (Appendix B's own test threshold for "reasonable").
+`ATFEResults` gained `Q_mechanical` (same quantity as `rotorPower`, named to
+match the spec's Appendix B wording).
+
+**Not done:** crediting dissipation to *product temperature* (the spec's
+"more importantly, in the product temperature") — only the duty/area credit
+is implemented; a real product-temperature-rise model from mechanical
+dissipation was judged out of scope for this pass and is flagged as a
+limitation rather than silently ignored.
+
+**10.2 — Condenser duty and coolant medium.** Two independent fixes:
+(a) **Vapour superheat**: the vapour leaving the liquid surface sits BPE
+degrees above its own dew point (`T_boil_pure`) at the system pressure — by
+definition of BPE — and must be de-superheated before it can condense. The
+old `Q_condenser = Q_latent` silently assumed BPE = 0 for the vapour stream.
+`Q_vapor_superheat = m_evap × Cp_vapor × BPE_mean / 3600` is now added, using
+the zone-march's mean `BPE_local_C` (or feed-basis BPE for `single_point`).
+⚠ `Cp_vapor` is approximated as 0.5× the liquid-phase Cp (no vapour-phase Cp
+data exists in `lib/data/solvents.ts`) — a rule-of-thumb pending real vapor
+Cp data. (b) **Coolant medium selection**: `coolingWaterTemp`,
+`chilledWaterTemp`, and `brineTemp` were all collected in Section 5 and NONE
+were read — the flow calculation used a hardcoded 10°C rise with no
+medium-specific basis. The engine now picks whichever of the three is
+supplied (priority: brine > chilled water > cooling water) and uses a
+medium-appropriate Cp/rise (⚠ placeholders: brine 3.5 kJ/kg·K / 5°C rise,
+chilled water 4.18 / 5°C, cooling water 4.18 / 10°C unchanged). A feasibility
+check errors when the selected medium's inlet temperature leaves less than a
+⚠ placeholder 5°C approach to the vapour dew point, and a warning flags deep
+vacuum (<100 mbar(a)) duties where the condenser duty is a large fraction of
+the evaporator duty — the condenser, not the evaporator, is often the
+limiting/most expensive item at that vacuum level, and this tool only sizes
+the evaporator body.
+
+## NEW — scripts/compare-sizing.ts
+
+Reads a JSON fixture (`{ jobs: [{ name, mode, inputs }] }`) and prints a
+table comparing `sizingMethod: 'single_point'` vs. `'zone_march'` for the
+SAME inputs: required/selected area under each path, the delta %, and a
+heuristic "likely driver" (Phase 6.1 outlet-basis viscosity vs. Phase 6.2
+rising BPE, inferred from the ratio/spread of the zone-march profile — this
+is explicitly a heuristic, not a rigorous phase attribution, since both
+sizing paths already share identical Phase 1-4 physics and only diverge in
+Phase 5/6). Run via `npx tsx scripts/compare-sizing.ts [fixture.json]` or
+`npm run compare-sizing -- fixture.json`; defaults to
+`scripts/fixtures/sample-jobs.json`, seeded with three synthetic jobs (a
+dilute aqueous case with a near-zero expected delta, a 15 wt% NaCl brine
+case, and a high-viscosity organic concentration duty mirroring the spec's
+own Phase 5 worked example). The fixture format (and how to merge a real
+past job onto `DEFAULT_INPUTS` so only the fields that matter need to be
+specified) is documented in the script's header comment for the engineering
+team to paste real quotes into.
+
+## What's still open (current, supersedes v3.0's list above)
+
+- **Phase 0**: DONE (all four items).
+- **Phase 8**: DONE (all six checks). Placeholders remain in the underlying
+  data (`freeVapourAreaFraction`, `shellID_m`, velocity limits — Appendix
+  A1/A10) and in Appendix A5's open question about whose limits table this is.
+- **Phase 9**: only 9.1/9.2 done (the continuous ladder). The full
+  `U_base × f_medium × f_wall` decomposition, and any work beyond the C&R
+  note in 9.3, remain open.
+- **Phase 10**: only 10.1/10.2 done. 10.3 (fouling-as-degradation-feedback,
+  explicitly "a pilot question, not a correlation question" per the spec) is
+  not modeled, matching the spec's own recommendation to surface it as a
+  pilot trigger rather than attempt to model it.
+- **Phase 11** (activity-coefficient thermodynamics — NRTL/UNIQUAC/UNIFAC
+  replacing ideal Raoult's law): still not implemented. Independent of every
+  other phase and can be picked up whenever.
+- **Appendix A** data gaps are unchanged from v3.0 — nothing in this pass
+  required inventing data that should have come from the engineering team;
+  every new constant introduced above carries a ⚠ marker.
+
+## Test coverage added (v3.1)
+
+`__tests__/engines/atfe-remediation.test.ts` gained four new `describe`
+blocks (Phase 0, Phase 8, Phase 9, Phase 10 — 17 new tests, 40 total in the
+file) covering: negative-overdesign-is-always-fail for both the ladder-
+exceeded and bodyOverride-undersized paths, parallel-unit proposal on gross
+oversizing, non-zero viscosity sensitivity in both modes for a measured
+Newtonian feed, `crAnalogue` now present and numerically different for hot
+oil vs. steam, solvent-category viscosity classification (`viscosityClassUsed`)
+disabling the sensitivity check with a `note` and erroring (not silently
+computing) in detailed mode, all six Phase 8 envelope checks firing on
+constructed violation cases, `U_continuous` matching Perry's anchors exactly
+at 1/100/10⁴/10⁶ cP and clamping/monotonicity at the extremes, `Q_mechanical`
+staying a small fraction of thermal duty and appearing in `Q_total`,
+condenser duty growing with BPE via the vapour-superheat term, coolant-medium
+selection priority (brine > chilled > cooling water), and the coolant-too-warm
+feasibility error. Two pre-existing tests needed updated expected values with
+phase-annotated comments (ground rule 4): `atfe.test.ts`'s Test Case 3
+(A_required/A_selected/overdesign status shift because Phase 9.2 makes
+preliminary-mode U continuous instead of a flat bucket default — the old
+values were an artifact of the step function this phase deliberately
+removes), and one Phase 2 test in `atfe-remediation.test.ts` that needed an
+explicit measured viscosity added so it still exercises the Phase 4
+film-coefficient correlation instead of the new Phase 0.4 category fallback.
+All 75 pre-existing tests (52 original + 23 from v3.0) plus the new 17 pass;
+92 total. The Thermax ±1% costing validation (10 tests) is untouched.
