@@ -15,11 +15,26 @@ export interface MOCRates {
 }
 
 // Material rates by MOC (₹/kg). [T] and [I] observed values.
+//
+// Phase 2 of the sizing remediation (ATFE_SPECIFICATION_v2.md) unified the
+// sizing engine's MOC field (lib/types.ts MOC, lib/data/materials.ts) with
+// this costing rate table so both use the SAME identifier — previously the
+// sizing engine never read MOC at all (hardcoded SS316/k=16) while costing's
+// contactMOC was a disconnected free string. SuperDuplex2507 / Alloy20 /
+// HastelloyC276 / Titanium / Nickel200 below are NEW entries added for that
+// unification — none of them appear in the [T]/[I] source sheets, so their
+// ₹/kg rates are ⚠ PLACEHOLDERS (rough multiples of the SS316L rate by known
+// relative material cost) pending an actual EcoProcess vendor quote.
 export const DEFAULT_MOC_RATES: MOCRates = {
   'SS304': 300,          // typical; confirm current market
   'SS316': 340,          // [I]-adjacent
   'SS316L': 350,         // [I]: shell 176050 / 503 kg = 350
   'Duplex2205': 475,     // [T]
+  'SuperDuplex2507': 650, // ⚠ PLACEHOLDER — not in [T]/[I]; typically ~35-40% above standard duplex
+  'Alloy20': 800,         // ⚠ PLACEHOLDER — not in [T]/[I]; nickel-iron-chromium alloy, well above duplex
+  'HastelloyC276': 1900,  // ⚠ PLACEHOLDER — not in [T]/[I]; high-nickel superalloy, typically 4-6x SS316L
+  'Titanium': 1400,       // ⚠ PLACEHOLDER — not in [T]/[I]
+  'Nickel200': 2200,      // ⚠ PLACEHOLDER — not in [T]/[I]; commercially pure nickel, among the most expensive here
   'CS': 85,              // [T] jacket
   'MS': 85,              // [I] jacket 27710/326 = 85
   'MS_BODY_FLANGE': 130, // [T] (⚠ [I] uses ~190 for MS flange — site variance, confirm)

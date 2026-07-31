@@ -503,6 +503,14 @@ Add a sub-section under "Operating Conditions" (Section 4):
 
 ## ATFE U-Value Ranges (for Preliminary Mode + Sanity Checks)
 
+> ⚠ **PARTIALLY SUPERSEDED — see ADDENDUM v3.0.** The lookup table below is
+> still the bucket table `u-ranges.ts` uses for preliminary mode's *starting
+> point*, but as of Phase 3 (v3.0) that value is no longer used directly — it
+> is corrected for the actual jacket medium via `mediumCorrectionFactor()`
+> before being reported. Preliminary mode used to be blind to heating medium
+> entirely (steam and hot-oil jobs sized identically); it no longer is. The
+> viscosity resolution priority described below is unchanged.
+
 ```
 U-VALUE LOOKUP (lib/data/u-ranges.ts):
 
@@ -534,6 +542,20 @@ Pure solvent viscosity proxy (LAST RESORT only):
 ---
 
 ## Calculation Engine: ATFE (lib/engines/atfe.ts)
+
+> ⚠ **SUPERSEDED — see ADDENDUM v3.0 (2026-07-31).** This section (through
+> "Additional Outputs" below) describes the engine as it shipped through
+> ADDENDUM v2.2, which is the model the remediation spec (the document that
+> produced ADDENDUM v3.0) diagnosed as wrong by factors of 2-4 for anything
+> that isn't a dilute, steam-heated, water-like job — a single-`U` evaluated
+> once at feed conditions, a fixed L/D=7 geometry with no real machine behind
+> it, a hardcoded 4mm/SS316/1000-rpm regardless of MOC or rotor, and a
+> penetration-theory contact time formula that made "detailed" mode have ZERO
+> viscosity dependence (`t_contact = blade_clearance / (π·D·N/60)` — dimensionally
+> a travel time, not a film-renewal time; see ADDENDUM v3.0 Phase 4 for why).
+> **Do not re-implement anything in this section from scratch — read
+> ADDENDUM v3.0 first.** Kept below only so the diff/history of what changed
+> is visible; it is not a description of the current engine.
 
 ### Input Processing
 
@@ -1079,3 +1101,363 @@ Root causes identified and verified (all 19 v2 validation tests still pass uncha
 Fixed-cost % rule (3–20% observed), hardware 5% vs 10%, consumables ₹15 vs ₹20/kg,
 BF machining lump-sum vs ₹/mm/dia formula semantics, SHE 60% weight rule,
 limpet ₹1,200/RMT scope, tube-rate outliers (Johnson ₹2,100).
+
+---
+
+# ADDENDUM v3.0 (2026-07-31) — Sizing Remediation: Phases 1-7
+
+**This addendum supersedes the "ATFE U-Value Ranges" and "Calculation Engine:
+ATFE" sections above for everything except the viscosity-resolution priority
+order, the pressure-unit conversion, and the mass-balance logic, which are
+unchanged.** It implements Phases 1 through 7 of the remediation spec that
+diagnosed the v2.2 engine as correct only for a dilute, aqueous,
+steam-heated job and wrong by 2-4× for anything that actually justifies
+buying an ATFE. **Phases 0, 8, 9, 10, and 11 of that spec are explicitly
+NOT done here** — see "What's still open" at the end of this addendum.
+
+Ground rules that governed this pass (unchanged from the remediation spec,
+repeated here because they explain choices below): the old single-point
+calculation is kept reachable behind `sizingMethod: 'single_point'`
+(`ATFEInputs`), default is `'zone_march'`; every uncalibrated numeric constant
+introduced carries a `⚠ PLACEHOLDER` comment in the source and is listed in
+"What's still open" below; `t_wall / k_wall` (not `1/k_wall`) is correct and
+was left alone.
+
+## Phase 1 — Body registry (lib/data/bodies.ts)
+
+`L_D_ratio = 7`, the `D_rotor = sqrt(A_est/(π·L_D_ratio))` back-derivation, and
+`N_rpm = 300` are gone from `lib/engines/atfe.ts`. Geometry now comes from
+`BODY_REGISTRY: ATFEBody[]`, one entry per standard size (same nominal ladder
+as before: 0.5, 1, 1.5, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20 m²). **Only the
+10 m² entry (`ATFE-10`) is anchored to a real machine** — the engineering
+team's own sample configuration (D=0.800 m, L_rotor=4.40 m, heated
+area=10 m² ⇒ L_heated≈3.98 m, SS316, ASME Sec VIII Div I). Every other entry
+is built by holding the anchor's rotor L/D (5.5) and heated-length fraction
+of rotor (90%) constant — see the file header comment for the exact formula
+and its self-consistency check against the anchor. **Replace with real GA
+dimensions before quoting anything outside the 10 m² frame (Appendix A1).**
+
+`selectStandardSize(A_required): number` (silently clamped to 20 m² above
+that) is replaced by `selectBody(A_required, bodyOverride?): SelectBodyResult`,
+a discriminated union (`{body, exceeded:false}` or
+`{body:null, exceeded:true, minUnits, largest}`). The engine now pushes a hard
+`errors[]` entry proposing N units in parallel when area is exceeded, instead
+of silently selecting the largest size and letting the overdesign% sanity
+check quietly go negative.
+
+rpm is derived, not fixed: `N_rpm = 60·V_tip_target/(π·D_rotor)`, where
+`V_tip_target` is the selected rotor's `tipSpeedBand_m_s.typical`
+(`lib/data/rotors.ts`, Phase 4). This holds tip speed constant across the
+whole size ladder — the old fixed-rpm approach drifted tip speed from
+3.35 m/s (1 m²) to 14.98 m/s (20 m²), outside the working band at both ends.
+`ATFEResults.body` reports `{id, nominalArea_m2, heatedArea_m2, D_rotor_m,
+L_rotor_m, L_heated_m, N_rpm, tipSpeed_m_s}` — nominal and heated area are
+reported as **separate fields**, currently equal for every registry entry.
+**Whether EcoProcess's own datasheets use "nominal" to mean heated area or
+the full-rotor wetted potential is NOT confirmed (Appendix A9)** — if it's
+the latter elsewhere, every selection here is one size optimistic.
+
+`ATFEInputs.bodyOverride?: string` forces a specific `BODY_REGISTRY` id (rate
+it rather than select it).
+
+## Phase 2 — MOC and wall thickness (lib/data/materials.ts)
+
+`t_wall = 0.004` / `k_wall = 16` (SS316, hardcoded, always) are gone. MOC is
+now a real, closed, 9-member type (`export type MOC = 'SS304' | 'SS316' |
+'SS316L' | 'Duplex2205' | 'SuperDuplex2507' | 'Alloy20' | 'HastelloyC276' |
+'Titanium' | 'Nickel200'`) with `MOC_PROPERTIES[moc].k_W_mK` cited to ASME
+BPVC II-D (Hastelloy to the Haynes datasheet). `ATFEInputs.contactParts` is
+now typed `MOC?` — previously the sizing engine never read this field at all.
+
+**This is the SAME field `lib/costing/` reads for ₹/kg pricing.**
+`CostingPanel.tsx`'s `CONTACT_MOCS` used to be a hardcoded 4-item array
+(`SS304/SS316/SS316L/Duplex2205`) with its OWN disconnected `useState`,
+completely independent of the sizing form's Contact Parts field — a quote
+could thermally size one material and cost a different one with no warning.
+Both now draw from `MOC_OPTIONS` (`lib/data/materials.ts`). Five MOCs added
+for this unification (`SuperDuplex2507`, `Alloy20`, `HastelloyC276`,
+`Titanium`, `Nickel200`) had no rate in the Thermax/IDHMA source sheets —
+`DEFAULT_MOC_RATES` (`lib/costing/rates.ts`) now carries ⚠ placeholder ₹/kg
+entries for them (rough multiples of the SS316L rate by known relative
+material cost), and the blade rate lookup (`bladeMOCKey`) still only
+distinguishes Duplex vs everything-else — every other MOC understates blade
+cost until per-MOC blade rates are added.
+
+Wall thickness per body per MOC (`ATFEBody.wallThickness_mm`) is a ⚠
+placeholder table (`REFERENCE_WALL_MM_AT_ANCHOR` in `bodies.ts`), scaled
+`t ∝ D` (thin-wall pressure-vessel theory) from a reference thickness at the
+10 m² anchor's diameter, per MOC. **Not from an actual pressure-design
+calculation.** `ATFEInputs.wallThicknessOverride_mm` lets an engineer rate a
+specific known machine instead.
+
+`Δ(t_wall/k_wall)` between two MOCs, everything else held constant, is the
+ONLY thing that changes in the resistance series — verified exactly by test
+(`__tests__/engines/atfe-remediation.test.ts`, "SS316 vs Hastelloy C276").
+
+## Phase 3 — Heating medium, jacket, and LMTD (lib/data/heating-media.ts)
+
+Two independent fixes:
+
+**3a. `h_outer` is no longer a 3-value constant, and preliminary mode is no
+longer medium-blind.** For condensing steam, `h_outer` stays the same
+constant it always was (8-12k W/m²K is a defensible constant per C&R Vol.6 —
+see Phase 9.3 discussion below). For a liquid jacket medium (hot water, hot
+oil), `computeHOuter(medium, jacketType, T_mean)` runs a Dittus-Boelter
+forced-convection correlation (`Nu = 0.023·Re^0.8·Pr^0.3`) using the medium's
+own property curves (`HEATING_MEDIA`) at the jacket mean temperature and a ⚠
+placeholder jacket geometry (`JACKET_GEOMETRY`: hydraulic diameter + assumed
+circulation velocity per `jacketType` — no real EcoProcess jacket GA drawings
+exist to calibrate these; the physically-expected ordering, dimple/half-pipe
+> plain, holds, but not the absolute magnitude). The hot-oil property curve
+(`OIL_DENSITY`/`OIL_CP`/`OIL_K`/`OIL_MU`) is a **generic synthetic
+heat-transfer-fluid stand-in** (Therminol-66-like published values) — no hot
+oil grade is specified anywhere in the supplied documents (Appendix A).
+
+Preliminary mode now reacts to this too, via `mediumCorrectionFactor()` — a
+2-resistor decomposition (`R_lumped = 1/U_bucket - 1/H_OUTER_STEAM_DEFAULT`,
+re-bundled at the actual jacket's h_outer) applied as a multiplier on the
+bucket lookup. This is pure resistance-series algebra, not a new calibrated
+assumption — **but note it was NOT well-posed on the first attempt**: an
+earlier version tried a 4-resistor decomposition holding fouling and wall
+resistance fixed at representative values, which for the highest-U bucket
+(2500 W/m²K, <10 cP) made the implied inner-film resistance go negative,
+silently short-circuiting to a no-op factor of 1 for exactly the water-like
+case this fix targets. The 2-resistor form is always well-posed as long as
+`U_bucket_default < H_OUTER_STEAM_DEFAULT` (true for the whole table), at the
+cost of folding wall/fouling into the lumped term — an acceptable
+simplification for a preliminary-mode-only correction (Phase 2's wall/MOC
+swap is not threaded into preliminary mode; that's Phase 9.1's `f_wall`, out
+of scope here). Verified by test: hot oil vs steam, identical duty/product,
+now differ materially in BOTH modes (previously identical in preliminary).
+
+**3b. ΔT is LMTD, not arithmetic, wherever the jacket medium isn't
+condensing.** `lmtd(T_medium_in, T_medium_out, T_boil)` degenerates EXACTLY
+to the old arithmetic ΔT when `dT1 ≈ dT2` (the condensing-steam case) —
+verified to 1e-9 by test — so every steam-heated test case (TC1-3) is
+numerically unaffected. For hot water/hot oil, `ATFEInputs.mediumOutletTemp_C`
+/ `mediumFlowRate_kgh` resolve the outlet temperature
+(`resolveMediumOutlet()`; falls back to treating the jacket as isothermal at
+the inlet temperature, with a warning, if neither is given — this preserves
+the old arithmetic-ΔT behavior as an honest fallback rather than silently
+computing something the engineer hasn't provided data for).
+`ATFEInputs.jacketType` (`plain | half_pipe_coil | dimple`) and
+`jacketFlowArrangement` (`counter_current | co_current`, default
+counter-current) are new form fields (Section 4).
+
+## Phase 4 — Rotor registry and film model (lib/data/rotors.ts)
+
+Two compounding defects fixed:
+
+**4a. Film renewal time.** `t_contact = blade_clearance/(π·D·N/60)` — "how
+long a blade takes to cross one clearance gap," dimensionally a travel time,
+physically meaningless — is replaced by `contactTime_s(rpm, nBlades) =
+60/(rpm·nBlades)`, the actual blade-passage-frequency film renewal time. At
+4 blades / 300 rpm the old formula gave ~1.7e-4 s where the correct value is
+0.05 s (~290× too short), which inflated `h_inner` to ~136,000 W/m²K and
+removed `1/h_inner` from the resistance series entirely. Verified exactly by
+test.
+
+**4b. Bare penetration theory has no viscosity term.** `filmCoefficient()`
+now bounds `h_inner` between the no-renewal limit (`h_cond = k/δ`, steady
+conduction across the film — δ is the rotor's effective clearance) and the
+perfect-renewal limit (`h_pen`, penetration theory), interpolated on
+viscosity via `η(μ) = 1/(1+(μ/μ*)^n)`:
+
+```
+h_inner = h_cond + η(μ)·(h_pen − h_cond)
+```
+
+**`μ* = 150 cP` and `n = 0.45` (`ETA_MU_STAR_CP`/`ETA_N` in `rotors.ts`) are
+the single most important uncalibrated numbers in the whole model** — chosen
+only to give a physically sensible S-curve, not from any published
+correlation. This is deliberate: it concentrates essentially all the
+remaining sizing uncertainty into one function that one pilot run can
+calibrate (Phase 7). **Do not tune these to make output numbers look
+reasonable.**
+
+`RotorType` (`lib/data/rotors.ts`, `RotorTypeId = 'fixed_rigid' |
+'hinged_pivoted' | 'roller_wiper' | 'contact_wiper'`) carries `⚠ PLACEHOLDER`
+film-thickness/blade-count/tip-speed-band/power-factor values (physically
+reasonable orderings, not measured — Appendix A2/A3) and hard-gates
+(`checkRotorGates()`, pushed to `errors[]`, not `warnings[]`): viscosity
+ceiling, wiper material temperature limit, and solids-abrasiveness
+tolerance. The 70,000 cP general viscosity limit vs the 400,000 cP sample
+configuration contradiction (Appendix A4) is encoded directly:
+`fixed_rigid`/`hinged_pivoted` cap at 70,000 cP, `roller_wiper` at 400,000
+(matching the sample), `contact_wiper` at 1,000,000 — **this partition is a
+guess pending engineering confirmation of which rotor series the sample
+config is actually describing.**
+
+`ATFEInputs.rotorType` (default `'fixed_rigid'` with a warning),
+`bladeCountOverride`, `solidsAbrasive` are new form fields (Section 6).
+
+**4.5 non-Newtonian gap-shear correction (optional).** `ATFEInputs
+.powerLawIndex_n` / `viscometerShearRate_s`, when both given, correct a
+lab-measured viscosity to the blade-gap shear rate
+(`correctViscosityToGapShear()`) before it enters the film model. Silent
+(Newtonian) when not given, with a warning above 1000 cP that this is
+likely the largest remaining uncertainty for a shear-thinning feed.
+
+## Phase 5 — Zone march (lib/engines/atfe.ts, marchZones logic inline)
+
+`A_required = (Q_total·1000)/(U_value·ΔT_eff)`, evaluated once at feed
+conditions, is now the **`single_point` fallback only**. The default
+(`ATFEInputs.sizingMethod ?? 'zone_march'`) marches N=20 (`zoneMarchN`)
+equal-INDEX zones down the machine (`massRemaining(i) = m_feed -
+m_evap·(i+0.5)/N`, matching the remediation spec's own pseudocode exactly —
+equal fractional progress through the machine, not equal duty-per-mass), and
+at each zone recomputes: local solids fraction, local viscosity (Phase 6),
+local BPE (Phase 6), local jacket medium temperature (honoring
+`jacketFlowArrangement` — linear interpolation between inlet/outlet across
+the N zones), local U (Phases 2-4), and local ΔT (arithmetic, since a thin
+zone slice is the numerical-integration equivalent of the analytical LMTD —
+LMTD itself is only used in the lumped `single_point` path). `dA =
+dQ/(U_local·ΔT_local)` is summed; `ATFEResults.profile: ZoneResult[]` reports
+every zone (`x_solids, mu_local_cP, T_boil_local_C, BPE_local_C, U_local,
+deltaT_local_C, dA_m2, dResidenceTime_min`) for the quote document and for
+audit. **Both `sizingMethod` paths use the SAME Phase 1-4 physics** — the
+comparison between them isolates the marching effect specifically, per the
+ground rule that past quotes need to be re-run both ways.
+
+`uValueOverride` and (for `single_point`) pilot calibration are applied
+**inside the U-resolution function itself**, not patched onto the top-level
+summary after the fact — an earlier version of this engine only patched the
+summary, which meant `uValueOverride` silently had NO effect on `A_required`
+under the (now-default) zone march, since each zone's independently-resolved
+U ignored it. Caught by test (`mixture.test.ts`, "uValueOverride trumps
+lookup") before merge, not after.
+
+Residence time (`ATFEResults.residenceTime_min`) is a **lumped estimate**
+(total film holdup — thickness × wetted area × density — divided by mean
+mass flow), distributed evenly across zones. It is NOT a true axial-transport
+integration; that would need a blade-pitch → axial-velocity correlation
+(Phase 4.4 in the remediation spec) which is not implemented — the spec
+gestures at "residence time falls out for free" without giving that
+correlation, and building one without real data would be exactly the kind of
+laundered-precision the ⚠ convention exists to prevent.
+
+**What did NOT get built in Phase 5:** per-zone re-evaluation of mixture
+vapor composition drift and per-zone component latent-heat weighting. Both
+remain feed-basis warnings (`boilingRangeSpread > 20`, latent-heat `spread >
+1.5`), same as before — turning those into real per-zone numbers needs a
+multicomponent flash calculation the remediation spec doesn't specify a
+formula for. Documented here rather than silently skipped.
+
+## Phase 6 — Outlet-basis viscosity, BPE, superheat (lib/engines/atfe.ts)
+
+`concentrateViscosity` (collected since the form's inception, read by
+nothing) now drives an exponential viscosity-vs-concentration model: given
+both feed and concentrate viscosity, `mu(x) = mu_feed·exp(k·(x−x_feed))` with
+`k` fit through the two anchor points, marched across all 20 zones. Without a
+concentrate viscosity, viscosity stays flat at the feed value across the
+whole march (same as the old single-point behavior) — with a loud warning
+when the discharge solids fraction meaningfully exceeds the feed's, since
+this is "the single largest sizing uncertainty for this job."
+
+BPE is now per-zone for the NaCl path (`bpeSource: 'nacl_auto'`): local NaCl
+wt% is derived from the (constant) NaCl mass and the zone's local
+`massRemaining`, **clamped to the correlation's stated validity ceiling
+(26 wt%)** with a one-time warning if the march would exceed it — the
+correlation (`calculateBPE_NaCl`, quadratic in concentration) was previously
+being fed feed-basis-only concentrations and would extrapolate to physically
+absurd values if applied naively at high-conversion discharge concentrations.
+`naclConcentration` was **NOT renamed** to `naclConcentrationFeed_wtPct` as
+the original remediation spec proposed — that would have been a breaking
+change to a required field every existing test fixture sets, forcing a TS
+excess-property compile error across the whole test file for a pure
+clarity-only rename. `naclConcentrationFeed_wtPct` exists as the
+clearer-named alias going forward; both resolve to the same feed-basis value.
+Manual/not-applicable BPE sources are unaffected (flat across the march, as
+before).
+
+`ATFEResults.Q_superheat` is new — the THIRD heat term the engineering
+team's own scale-up document lists ("super heat for any boiling point raise
+as the liquid becomes concentrated") that the pre-v3.0 engine never computed
+at all (`Q_total = Q_sensible + Q_latent` only). Accumulated zone-by-zone as
+`massRemaining · Cp_feed · (T_boil_local − T_boil_prev_local) / 3600`; zero
+whenever BPE doesn't vary along the machine. **Note:** the area-sizing duty
+distribution (`dQ = Q_total_preSuperheat/N`) does NOT include superheat — it
+is added to the reported `Q_total` (utilities/condenser sizing) after the
+march, not fed back into the area calculation, because doing so would need a
+fixed-point loop (superheat depends on the very BPE profile the march is
+computing). A defensible, documented simplification, not an oversight.
+
+Antoine extrapolation guards (remediation spec Phase 6.4) were **not**
+implemented — `SOLVENT_DB` entries carry no validity range fields yet.
+
+## Phase 7 — Pilot calibration (lib/data/pilot-runs.ts)
+
+`PilotRun` + localStorage-backed store (same pattern as
+`lib/costing/rates-store.ts`) gives pilot data somewhere to go for the first
+time — previously `pilotTriggers` was purely advisory strings with no
+corresponding input path anywhere in the repo.
+`invertPilotToFilmCoeff(run)` backs out the implied inner film coefficient
+from a measured U + the pilot machine's own wall/MOC/jacket, **throwing** when
+the measured U is physically impossible for the stated hardware
+(`R_film <= 0`) — doubling as a data-quality check on historical records.
+`scaleUpFilmCoeff(h_i_pilot, f)` requires `f` explicitly; **there is no
+default and none should ever be added** until at least three real
+pilot-to-plant pairs exist to fit it (Appendix A6).
+`ATFEInputs.pilotRunId` + `scaleUpFactor_f` wire a stored run into
+`U_source: 'pilot_calibrated'`, ranked above lookup/calculated but below an
+explicit `uValueOverride` (priority: `override > pilot_calibrated >
+calculated > lookup`).
+
+**Known limitation, called out explicitly rather than silently accepted:**
+pilot calibration currently overrides only the reported feed-zone U for
+`sizingMethod: 'zone_march'` (a warning says so in the output) — it is NOT
+propagated through the full marched profile. The remediation spec is explicit
+that the *correct* procedure is to invert the pilot run against the SAME
+zone-march structure used for full-scale sizing (march the pilot machine,
+fit `η(μ)` so the marched pilot area reproduces the measured pilot area, then
+march the full-scale machine with that fitted `η`) — "this is the whole
+point of the phase ordering." That fitting procedure (numerically solving
+for `μ*`/`n` in Phase 4's `η(μ)` from one or more pilot marches) is a
+nontrivial follow-on activity in its own right and was not built here;
+flagging the gap honestly was judged better than either skipping pilot
+support entirely or quietly shipping a partial integration without saying so.
+
+## What's still open (explicitly out of scope for this pass)
+
+Phases 0, 8, 9, 10, and 11 of the remediation spec are **not implemented**:
+
+- **Phase 0** (guard rails): the size-ladder "hard failure" is effectively
+  subsumed by Phase 1's `selectBody` discriminated result, but the
+  ⚠-marked stopgap widening of the sensitivity perturbation, the
+  `SOLVENT_VISCOSITY_PROXY` → `ViscosityClass` enum fix, and extending
+  `crAnalogue` beyond steam are not done.
+- **Phase 8** (envelope checks): loading rate, turndown, residence-time
+  limit enforcement (a number now exists — `residenceTime_min` — but nothing
+  checks it against the <1 min limit), viscosity ceiling is enforced only via
+  the Phase 4 rotor gates (not a standalone check), and vapor velocity is not
+  computed at all.
+- **Phase 9** (U-lookup rebuild): the preliminary bucket table is still a
+  step function (`U_RANGES` in `u-ranges.ts`); `mediumCorrectionFactor` reacts
+  to jacket medium but the bucket boundaries themselves are unchanged, and the
+  top bucket is still flat above 2000 cP (not extended to Perry's anchors at
+  10⁴/10⁵/10⁶ cP).
+- **Phase 10** (rotor power / condenser): `rotorPower` and `Q_condenser` are
+  untouched from v2.2 — mechanical dissipation is still not credited to the
+  heat balance, and condenser sizing still ignores vapor superheat and
+  non-condensables.
+- **Phase 11** (thermodynamics / activity coefficients): mixtures still use
+  ideal Raoult's law plus the hardcoded non-ideal-pair warning list.
+
+## Test coverage added
+
+`__tests__/engines/atfe-remediation.test.ts` (23 tests) exercises the
+specific per-phase deliverables above: the ATFE-10 anchor dimensions, tip
+speed held constant across the size ladder, `selectBody` hard-failure
+signaling, SS316-vs-Hastelloy `Δ(t/k)` exactness, `lmtd()` degeneracy,
+steam-vs-hot-oil medium sensitivity in both calculation modes, `t_contact`
+exactness, viscosity- and rotor-type-dependence of detailed-mode U (both
+previously impossible), rotor viscosity-ceiling gating, zone-march-vs-
+single-point divergence on a concentration duty, zone-count convergence,
+BPE/`Q_superheat` behavior along the march, and pilot inversion round-trip
+plus its physical-impossibility guard. All pre-existing 52 tests pass
+unchanged — none of their asserted values needed to change (the water/
+toluene/NaCl-brine test cases in this repo happen to have flat-or-near-flat
+viscosity and BPE profiles, so the zone march reproduces the old single-point
+numbers for them; the divergence Phase 5 is meant to catch only shows up on
+a genuine concentration duty with a supplied concentrate viscosity, which is
+exactly what `atfe-remediation.test.ts` adds a case for).

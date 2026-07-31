@@ -2,6 +2,8 @@
 import { useState } from 'react';
 import type { ATFEInputs, CalculationMode } from '@/lib/types';
 import { SOLVENT_LIST } from '@/lib/data/solvents';
+import { MOC_OPTIONS } from '@/lib/data/materials';
+import { ROTOR_REGISTRY } from '@/lib/data/rotors';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -441,10 +443,45 @@ export default function AtfeForm({ onCalculate, mode }: Props) {
           </Field>
         )}
         {(f.heatingMedium === 'hot_water' || f.heatingMedium === 'hot_oil') && (
-          <Field label={f.heatingMedium === 'hot_water' ? 'Hot Water Temperature' : 'Hot Oil Temperature'} required hint="°C">
-            {inp('hotMediumTemp', '120')}
-          </Field>
+          <>
+            <Field label={f.heatingMedium === 'hot_water' ? 'Hot Water Inlet Temperature' : 'Hot Oil Inlet Temperature'} required hint="°C">
+              {inp('hotMediumTemp', '120')}
+            </Field>
+            {/* Phase 3: liquid jacket media cool as they give up heat — LMTD (not
+                arithmetic ΔT) needs the outlet side too. Steam is condensing
+                (inlet = outlet = T_sat) so it never shows these fields. */}
+            <FieldRow>
+              <Field label="Medium Outlet Temperature" hint="°C — leave blank to derive from flow rate, or fall back to arithmetic ΔT">
+                {inp('mediumOutletTemp_C', 'auto')}
+              </Field>
+              <Field label="Medium Flow Rate" hint="kg/hr — used to derive outlet temp if not entered directly">
+                {inp('mediumFlowRate_kgh', 'auto')}
+              </Field>
+            </FieldRow>
+            <FieldRow>
+              <Field label="Jacket Type">
+                {sel('jacketType', [
+                  { value: 'plain', label: 'Plain jacket' },
+                  { value: 'half_pipe_coil', label: 'Half-pipe coil' },
+                  { value: 'dimple', label: 'Dimple jacket' },
+                ])}
+              </Field>
+              <Field label="Jacket Flow Arrangement">
+                {sel('jacketFlowArrangement', [
+                  { value: 'counter_current', label: 'Counter-current' },
+                  { value: 'co_current', label: 'Co-current' },
+                ])}
+              </Field>
+            </FieldRow>
+          </>
         )}
+
+        <Field label="Sizing Method" hint="Zone march (recommended) evaluates viscosity/BPE/U at 20 points down the machine instead of once at feed conditions — the controlling film is at the discharge, not the inlet. Single-point is kept to re-run past quotes for comparison.">
+          {sel('sizingMethod', [
+            { value: 'zone_march', label: 'Zone march (recommended)' },
+            { value: 'single_point', label: 'Single-point (legacy — for comparison only)' },
+          ])}
+        </Field>
 
         <FieldRow>
           <Field label="Operating Hours/Day" hint="hours">
@@ -511,12 +548,11 @@ export default function AtfeForm({ onCalculate, mode }: Props) {
 
       {/* Section 6 */}
       <Section id="s6" title="Section 6 — Materials of Construction" expanded={expanded.s6} onToggle={() => toggle('s6')}>
-        <Field label="Contact Parts (Wetted)">
-          {sel('contactParts', [
-            'SS304','SS304L','SS316','SS316L','SS316Ti',
-            'Duplex2205','Duplex2507','Hastelloy C22','Hastelloy C276',
-            'Titanium','Inconel',
-          ].map(v => ({ value: v, label: v })))}
+        <Field label="Contact Parts (Wetted)" hint="Drives BOTH the thermal wall-resistance calculation (Phase 2) and factory costing — the same field, not two separate choices.">
+          {sel('contactParts', MOC_OPTIONS.map(o => ({ value: o.value, label: o.label })))}
+        </Field>
+        <Field label="Wall Thickness Override" hint="mm — leave blank to use the standard body's design thickness for the selected MOC">
+          {inp('wallThicknessOverride_mm', 'auto')}
         </Field>
         <Field label="Non-Contact Parts">
           {sel('nonContactParts', ['MS','SS304','SS316','CS'].map(v => ({ value: v, label: v })))}
@@ -531,6 +567,38 @@ export default function AtfeForm({ onCalculate, mode }: Props) {
         <Field label="Gasket Material">
           {sel('gasketMaterial', ['PTFE','Viton','FFKM','Graphite','Asbestos free'].map(v => ({ value: v, label: v })))}
         </Field>
+
+        {/* Phase 4 rotor sub-section — the single largest lever on U above a
+            few hundred cP (a 2-3.5× area difference between rotor types at
+            high viscosity), and previously not modeled at all. */}
+        <div className="rounded-md border border-gray-200 bg-gray-50 p-3 space-y-2">
+          <p className="text-xs font-semibold text-gray-700">Rotor</p>
+          <Field label="Rotor Type" hint="Sets the effective film thickness — dominates U above ~1000 cP. Defaults to fixed rigid blade if not selected.">
+            {sel('rotorType', Object.values(ROTOR_REGISTRY).map(r => ({ value: r.id, label: r.label })))}
+          </Field>
+          <FieldRow>
+            <Field label="Blade Count Override" hint="leave blank for the rotor's default">
+              {inp('bladeCountOverride', 'auto')}
+            </Field>
+            <Field label="Solids Abrasive?">
+              {/* solidsAbrasive is a boolean field — the generic sel() helper only
+                  stores raw strings (a stored "false" is truthy in JS), so this
+                  needs its own onValueChange doing an explicit conversion. */}
+              <Select
+                value={f.solidsAbrasive ? 'true' : 'false'}
+                onValueChange={(v) => { if (v != null) setField('solidsAbrasive', v === 'true'); }}
+              >
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue placeholder="Select…" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="false">No / soft solids</SelectItem>
+                  <SelectItem value="true">Yes — abrasive</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+          </FieldRow>
+        </div>
       </Section>
 
       {/* Section 7 */}

@@ -6,12 +6,18 @@
 import { useMemo, useState } from 'react';
 import { calculateATFECosting, type CostingResults } from '@/lib/costing/engine';
 import { type RatesConfig, loadRatesConfig } from '@/lib/costing/rates-store';
+import { MOC_OPTIONS } from '@/lib/data/materials';
 import RatesSettings from './RatesSettings';
 
 const fmtINR = (n: number) =>
   '₹' + n.toLocaleString('en-IN', { maximumFractionDigits: 0 });
 
-const CONTACT_MOCS = ['SS304', 'SS316', 'SS316L', 'Duplex2205'];
+// Phase 2 (ATFE_SPECIFICATION_v2.md): this list used to be a hardcoded 4-item
+// array (SS304/SS316/SS316L/Duplex2205) completely disconnected from the
+// sizing form's own Contact Parts field (lib/types.ts MOC) — a quote could
+// thermally size one material and cost a different one without any warning.
+// Both now draw from the same canonical MOC_OPTIONS list.
+const CONTACT_MOCS = MOC_OPTIONS.map(o => o.value);
 
 export default function CostingPanel({ sizedArea }: { sizedArea: number | null }) {
   const [subTab, setSubTab] = useState<'estimate' | 'rates'>('estimate');
@@ -28,6 +34,11 @@ export default function CostingPanel({ sizedArea }: { sizedArea: number | null }
       return calculateATFECosting({
         area_m2: effectiveArea,
         contactMOC,
+        // ⚠ Only two blade rate SKUs exist (BLADE=Duplex-priced, BLADE_SS316L)
+        // — every non-Duplex MOC falls back to the SS316L blade rate, which
+        // understates blade cost for the exotic alloys added in Phase 2
+        // (HastelloyC276, Titanium, Nickel200, etc.). Add per-MOC blade rates
+        // to DEFAULT_MOC_RATES (lib/costing/rates.ts) before quoting those.
         bladeMOCKey: contactMOC === 'Duplex2205' ? 'BLADE' : 'BLADE_SS316L',
         mocRates: cfg.mocRates,
         thickness: cfg.thickness,

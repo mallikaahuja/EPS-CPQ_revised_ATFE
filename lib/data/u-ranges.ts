@@ -68,12 +68,10 @@ export function getPowerPerArea(viscosity_cP: number): number {
   return 15;
 }
 
-// Standard ATFE sizes available (m²)
-export const STANDARD_SIZES = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0];
-
-export function selectStandardSize(A_required: number): number {
-  for (const size of STANDARD_SIZES) {
-    if (size >= A_required) return size;
-  }
-  return STANDARD_SIZES[STANDARD_SIZES.length - 1];
-}
+// STANDARD_SIZES / selectStandardSize removed — Phase 1 (ATFE_SPECIFICATION_v2.md).
+// Geometry is now a real machine (lib/data/bodies.ts: ATFEBody, BODY_REGISTRY,
+// selectBody), not a bare area number. The old function silently clamped any
+// A_required above 20 m² to the 20 m² entry, which fed a negative
+// overdesign_pct into a sanity check that could only ever report 'warning' —
+// selectBody() returns a discriminated result instead so that case is a hard
+// error. See lib/data/bodies.ts.
